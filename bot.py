@@ -5,9 +5,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from datetime import datetime, timedelta
 import asyncio
 
-BOT_TOKEN = os.getenv("8468290286:AAGOf234scakMkfJsC1BU-3Zw4jf5Dqt4o8")
-ADMIN_CHAT_ID = int(os.getenv("635939460"))
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway gives this automatically for Postgres
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Connect to PostgreSQL
 def db_connect():
