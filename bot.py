@@ -5,43 +5,39 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from sqlalchemy import create_engine, Column, Integer, Date
 from sqlalchemy.orm import declarative_base, sessionmaker
-from apscheduler.schedulers.background import BackgroundScheduler
-from asyncio import get_event_loop
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID") or 0)
 DATABASE_URL = os.getenv("DATABASE_URL") or ""
 if not (BOT_TOKEN and ADMIN_CHAT_ID and DATABASE_URL):
-    raise ValueError("Set BOT_TOKEN, ADMIN_CHAT_ID, DATABASE_URL as env vars.")
+    raise ValueError("Set BOT_TOKEN, ADMIN_CHAT_ID, DATABASE_URL")
 
-# --- DB ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
     chat_id = Column(Integer, nullable=False, unique=True)
-    birthday = Column(Date, nullable=False)          # full date; year ignored for logic
+    birthday = Column(Date, nullable=False)
     last_completed_year = Column(Integer, nullable=True)
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
-# --- Helpers ---
-def birthday_this_year(bd: date, today: date) -> date:
-    # Handles Feb 29 by falling back to Feb 28 on non-leap years
-    y = today.year
-    try:
-        return date(y, bd.month, bd.day)
-    except ValueError:
-        return date(y, 2, 28)
+def bdy_this_year(bd: date, today: date) -> date:
+    try: return date(today.year, bd.month, bd.day)
+    except ValueError: return date(today.year, 2, 28)
 
-# --- Commands ---
+# ---- Commands ----
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Use /setbirthday YYYY-MM-DD, /mytask, /done, /summary (admin).")
+    logging.info("/start by %s", update.effective_chat.id)
+    await update.message.reply_text("Commands: /setbirthday YYYY-MM-DD • /mytask • /done • /summary (admin)")
 
 async def set_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("/setbirthday by %s", update.effective_chat.id)
     if len(context.args) != 1:
         return await update.message.reply_text("Usage: /setbirthday YYYY-MM-DD")
     try:
@@ -49,98 +45,83 @@ async def set_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
     s = Session()
-    user = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
-    if user:
-        user.birthday = bd
-        # do not reset last_completed_year here
-    else:
-        s.add(User(chat_id=update.effective_chat.id, birthday=bd))
+    u = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
+    if u: u.birthday = bd
+    else: s.add(User(chat_id=update.effective_chat.id, birthday=bd))
     s.commit(); s.close()
-    await update.message.reply_text(f"Birthday set to {bd}. IPPT window: 100 days after each birthday.")
+    await update.message.reply_text(f"Birthday set: {bd}. IPPT window is 100 days after each birthday.")
 
 async def done(update: Update, _: ContextTypes.DEFAULT_TYPE):
     s = Session()
-    user = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
-    if not user:
+    u = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
+    if not u:
         s.close(); return await update.message.reply_text("Set your birthday first: /setbirthday YYYY-MM-DD")
-    user.last_completed_year = datetime.now().year
+    u.last_completed_year = datetime.now().year
     s.commit(); s.close()
     await update.message.reply_text("IPPT marked completed for this year. Reminders stopped.")
 
 async def mytask(update: Update, _: ContextTypes.DEFAULT_TYPE):
     s = Session()
-    user = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
-    if not user:
+    u = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
+    if not u:
         s.close(); return await update.message.reply_text("Set your birthday: /setbirthday YYYY-MM-DD")
-    today = datetime.now().date()
-    bdy = birthday_this_year(user.birthday, today)
+    today = datetime.now().date(); bdy = bdy_this_year(u.birthday, today)
     days_since = (today - bdy).days
-    if user.last_completed_year == today.year:
-        status = "✅ Completed this year."
+    if u.last_completed_year == today.year:
+        msg = "✅ Completed this year."
     elif 0 <= days_since <= 100:
-        status = f"❌ Pending. {100 - days_since} days left."
+        msg = f"❌ Pending. {100 - days_since} days left."
     elif days_since < 0:
-        status = "❌ Pending. Window not started yet."
+        msg = "❌ Pending. Window not started yet."
     else:
-        status = "❌ Pending. Window expired."
+        msg = "❌ Pending. Window expired."
     s.close()
-    await update.message.reply_text(f"Birthday: {user.birthday}  •  {status}")
+    await update.message.reply_text(f"Birthday: {u.birthday} • {msg}")
 
 async def summary(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        return
+    if update.effective_chat.id != ADMIN_CHAT_ID: return
     s = Session(); today = datetime.now().date()
-    rows = s.query(User).all()
     pending = []
-    for u in rows:
-        bdy = birthday_this_year(u.birthday, today)
+    for u in s.query(User).all():
+        if u.last_completed_year == today.year: continue
+        bdy = bdy_this_year(u.birthday, today)
         days_since = (today - bdy).days
-        if u.last_completed_year != today.year and 0 <= days_since <= 100:
+        if 0 <= days_since <= 100:
             pending.append(f"{u.chat_id}: {100 - days_since} days left (BD {u.birthday})")
     s.close()
-    if not pending:
-        await update.message.reply_text("No users in active 100-day window.")
-    else:
-        await update.message.reply_text("Pending (within 100 days after birthday):\n" + "\n".join(pending))
+    await update.message.reply_text("No users in active 100-day window." if not pending
+                                    else "Pending (within 100 days after birthday):\n" + "\n".join(pending))
 
-# --- Scheduled jobs ---
+# ---- Scheduled jobs ----
 async def send_reminders(app):
     s = Session(); today = datetime.now().date()
     for u in s.query(User).all():
-        if u.last_completed_year == today.year:
-            continue
-        bdy = birthday_this_year(u.birthday, today)
+        if u.last_completed_year == today.year: continue
+        bdy = bdy_this_year(u.birthday, today)
         days_since = (today - bdy).days
         if 0 <= days_since <= 100:
             days_left = 100 - days_since
-            if days_left % 10 == 0 or days_left == 100:  # 100,90,...,0
+            if days_left % 10 == 0 or days_left == 100:
                 try:
-                    await app.bot.send_message(
-                        chat_id=u.chat_id,
-                        text=f"IPPT reminder: {days_left} days left to complete this year's IPPT. Send /done when finished."
-                    )
+                    await app.bot.send_message(u.chat_id, f"IPPT reminder: {days_left} days left. Send /done when finished.")
                 except Exception as e:
-                    logging.warning(f"Notify fail {u.chat_id}: {e}")
+                    logging.warning("Notify fail %s: %s", u.chat_id, e)
     s.close()
 
 async def send_admin_report(app):
     s = Session(); today = datetime.now().date()
     report = []
     for u in s.query(User).all():
-        if u.last_completed_year == today.year:
-            continue
-        bdy = birthday_this_year(u.birthday, today)
+        if u.last_completed_year == today.year: continue
+        bdy = bdy_this_year(u.birthday, today)
         days_since = (today - bdy).days
         if 0 <= days_since <= 30:
             report.append(f"{u.chat_id} (BD {u.birthday}, {30 - days_since}d of first 30)")
     s.close()
     if report:
-        try:
-            await app.bot.send_message(ADMIN_CHAT_ID, "Within first 30 days after birthday:\n" + "\n".join(report))
-        except Exception as e:
-            logging.warning(f"Admin report fail: {e}")
+        try: await app.bot.send_message(ADMIN_CHAT_ID, "Within first 30 days after birthday:\n" + "\n".join(report))
+        except Exception as e: logging.warning("Admin report fail: %s", e)
 
-# --- Main ---
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -149,13 +130,14 @@ def main():
     app.add_handler(CommandHandler("mytask", mytask))
     app.add_handler(CommandHandler("summary", summary))
 
-    scheduler = BackgroundScheduler()
-    loop = get_event_loop()
-    scheduler.add_job(lambda: loop.create_task(send_reminders(app)), "interval", days=1)
-    scheduler.add_job(lambda: loop.create_task(send_admin_report(app)), "interval", days=1)
-    scheduler.start()
+    sched = AsyncIOScheduler()
+    sched.add_job(send_reminders, "cron", hour=0, minute=5, args=[app])
+    sched.add_job(send_admin_report, "cron", hour=0, minute=10, args=[app])
+    sched.start()
     logging.info("Scheduler started.")
-    app.run_polling()
+
+    # IMPORTANT: clears any webhook so polling receives updates
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 if __name__ == "__main__":
     main()
