@@ -88,6 +88,58 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You haven't set your birthday yet.")
     session.close()
 
+async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a summary of users and task status to the admin."""
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("You are not authorized to view this summary.")
+        return
+
+    session = Session()
+    total_users = session.query(User).count()
+    pending_tasks = session.query(User).filter_by(task_done=False).count()
+    upcoming_30_days = session.query(User).filter(
+        (User.birthday - datetime.now().date()).between(0, 30)
+    ).all()
+
+    msg = f"📊 Summary:\n"
+    msg += f"Total Users: {total_users}\n"
+    msg += f"Pending Tasks: {pending_tasks}\n"
+    msg += "Users with birthdays in next 30 days:\n"
+
+    if upcoming_30_days:
+        for user in upcoming_30_days:
+            days_left = (user.birthday - datetime.now().date()).days
+            msg += f"- {user.chat_id} ({user.birthday}, {days_left} days left)\n"
+    else:
+        msg += "None"
+
+    await update.message.reply_text(msg)
+    session.close()
+
+async def mytask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send the user their own task status."""
+    session = Session()
+    user = session.query(User).filter_by(chat_id=update.effective_chat.id).first()
+
+    if not user:
+        await update.message.reply_text(
+            "You haven't set your birthday yet. Use /setbirthday YYYY-MM-DD to register."
+        )
+        session.close()
+        return
+
+    today = datetime.now().date()
+    days_left = (user.birthday - today).days
+    status = "✅ Completed" if user.task_done else "❌ Pending"
+
+    msg = f"📋 Your Task Status:\n"
+    msg += f"Birthday: {user.birthday}\n"
+    msg += f"Days until birthday: {days_left}\n"
+    msg += f"Task Status: {status}"
+
+    await update.message.reply_text(msg)
+    session.close()
+
 # =====================
 # JOB FUNCTIONS
 # =====================
@@ -136,21 +188,21 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setbirthday", set_birthday))
     app.add_handler(CommandHandler("done", done))
+    app.add_handler(CommandHandler("summary", summary))
+    app.add_handler(CommandHandler("mytask", mytask))
 
-    # Start scheduler
+    # Start APScheduler
     scheduler = BackgroundScheduler()
-
-    # APScheduler cannot await async functions directly; wrap with create_task
     from asyncio import get_event_loop
-
     loop = get_event_loop()
+
+    # Schedule daily jobs
     scheduler.add_job(lambda: loop.create_task(send_reminders(app)), 'interval', days=1)
     scheduler.add_job(lambda: loop.create_task(send_admin_report(app)), 'interval', days=1)
-
     scheduler.start()
     logging.info("Scheduler started.")
 
-    # Start bot
+    # Run bot
     app.run_polling()
 
 if __name__ == "__main__":
