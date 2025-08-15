@@ -2,14 +2,11 @@ import os
 import logging
 from datetime import datetime, timedelta
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from sqlalchemy import create_engine, Column, Integer, Date, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # =====================
 # CONFIG
@@ -71,7 +68,9 @@ async def set_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(user)
 
         session.commit()
-        await update.message.reply_text(f"Birthday set to {birthday}. Reminders will start 100 days before.")
+        await update.message.reply_text(
+            f"Birthday set to {birthday}. Reminders will start 100 days before."
+        )
 
     except ValueError:
         await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
@@ -92,7 +91,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================
 # JOB FUNCTIONS
 # =====================
-async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+async def send_reminders(app: ApplicationBuilder):
     session = Session()
     today = datetime.now().date()
     for user in session.query(User).filter_by(task_done=False).all():
@@ -101,7 +100,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             days_left = (user.birthday - today).days
             if days_left % 10 == 0:
                 try:
-                    await context.bot.send_message(
+                    await app.bot.send_message(
                         chat_id=user.chat_id,
                         text=f"Reminder: {days_left} days left to complete your task! Send /done when finished.",
                     )
@@ -109,7 +108,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                     logging.error(f"Failed to send reminder to {user.chat_id}: {e}")
     session.close()
 
-async def send_admin_report(context: ContextTypes.DEFAULT_TYPE):
+async def send_admin_report(app: ApplicationBuilder):
     session = Session()
     today = datetime.now().date()
     report_users = []
@@ -118,16 +117,19 @@ async def send_admin_report(context: ContextTypes.DEFAULT_TYPE):
             report_users.append(f"User {user.chat_id} - Birthday: {user.birthday}")
 
     if report_users:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text="📋 Pending tasks (within 30 days):\n" + "\n".join(report_users),
-        )
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="📋 Pending tasks (within 30 days):\n" + "\n".join(report_users),
+            )
+        except Exception as e:
+            logging.error(f"Failed to send admin report: {e}")
     session.close()
 
 # =====================
 # MAIN
 # =====================
-async def main():
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Add handlers
@@ -135,13 +137,21 @@ async def main():
     app.add_handler(CommandHandler("setbirthday", set_birthday))
     app.add_handler(CommandHandler("done", done))
 
-    # Add jobs safely
-    job_queue = app.job_queue
-    job_queue.run_daily(check_reminders, time=datetime.min.time())
-    job_queue.run_daily(send_admin_report, time=datetime.min.time())
+    # Start scheduler
+    scheduler = BackgroundScheduler()
 
-    await app.run_polling()
+    # APScheduler cannot await async functions directly; wrap with create_task
+    from asyncio import get_event_loop
+
+    loop = get_event_loop()
+    scheduler.add_job(lambda: loop.create_task(send_reminders(app)), 'interval', days=1)
+    scheduler.add_job(lambda: loop.create_task(send_admin_report(app)), 'interval', days=1)
+
+    scheduler.start()
+    logging.info("Scheduler started.")
+
+    # Start bot
+    app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
