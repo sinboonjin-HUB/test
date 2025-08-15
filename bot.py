@@ -2,20 +2,36 @@ import os
 import logging
 from datetime import datetime, timedelta
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from sqlalchemy import create_engine, Column, Integer, String, Date, Boolean
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
+from sqlalchemy import create_engine, Column, Integer, Date, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
+# =====================
+# CONFIG
+# =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8468290286:AAGOf234scakMkfJsC1BU-3Zw4jf5Dqt4o8")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "635939460"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL not set! Attach PostgreSQL in Railway and ensure DATABASE_URL is set.")
+
+# =====================
+# LOGGING
+# =====================
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 
+# =====================
+# DATABASE SETUP
+# =====================
 Base = declarative_base()
 
 class User(Base):
@@ -29,6 +45,9 @@ engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
+# =====================
+# COMMANDS
+# =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! Send /setbirthday YYYY-MM-DD to register your birthday."
@@ -70,10 +89,12 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You haven't set your birthday yet.")
     session.close()
 
+# =====================
+# JOB FUNCTIONS
+# =====================
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     session = Session()
     today = datetime.now().date()
-
     for user in session.query(User).filter_by(task_done=False).all():
         reminder_start = user.birthday - timedelta(days=100)
         if reminder_start <= today <= user.birthday:
@@ -82,7 +103,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         chat_id=user.chat_id,
-                        text=f"Reminder: {days_left} days left to complete your task! Send /done when finished."
+                        text=f"Reminder: {days_left} days left to complete your task! Send /done when finished.",
                     )
                 except Exception as e:
                     logging.error(f"Failed to send reminder to {user.chat_id}: {e}")
@@ -99,21 +120,28 @@ async def send_admin_report(context: ContextTypes.DEFAULT_TYPE):
     if report_users:
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text="📋 Pending tasks (within 30 days):\n" + "\n".join(report_users)
+            text="📋 Pending tasks (within 30 days):\n" + "\n".join(report_users),
         )
     session.close()
 
-def main():
+# =====================
+# MAIN
+# =====================
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setbirthday", set_birthday))
     app.add_handler(CommandHandler("done", done))
 
-    app.job_queue.run_daily(check_reminders, time=datetime.min.time())
-    app.job_queue.run_daily(send_admin_report, time=datetime.min.time())
+    # Add jobs safely
+    job_queue = app.job_queue
+    job_queue.run_daily(check_reminders, time=datetime.min.time())
+    job_queue.run_daily(send_admin_report, time=datetime.min.time())
 
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
