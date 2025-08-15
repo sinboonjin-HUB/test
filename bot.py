@@ -1,208 +1,160 @@
-import os
-import logging
-from datetime import datetime, timedelta
+# bot.py
+import os, logging
+from datetime import datetime, date
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from sqlalchemy import create_engine, Column, Integer, Date, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, Column, Integer, Date
+from sqlalchemy.orm import declarative_base, sessionmaker
 from apscheduler.schedulers.background import BackgroundScheduler
+from asyncio import get_event_loop
 
-# =====================
-# CONFIG
-# =====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8468290286:AAGOf234scakMkfJsC1BU-3Zw4jf5Dqt4o8")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "635939460"))
-DATABASE_URL = os.getenv("DATABASE_URL")
+# --- Config ---
+BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID") or 0)
+DATABASE_URL = os.getenv("DATABASE_URL") or ""
+if not (BOT_TOKEN and ADMIN_CHAT_ID and DATABASE_URL):
+    raise ValueError("Set BOT_TOKEN, ADMIN_CHAT_ID, DATABASE_URL as env vars.")
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL not set! Attach PostgreSQL in Railway and ensure DATABASE_URL is set.")
-
-# =====================
-# LOGGING
-# =====================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-# =====================
-# DATABASE SETUP
-# =====================
+# --- DB ---
 Base = declarative_base()
-
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    chat_id = Column(Integer, nullable=False)
-    birthday = Column(Date, nullable=False)
-    task_done = Column(Boolean, default=False)
+    chat_id = Column(Integer, nullable=False, unique=True)
+    birthday = Column(Date, nullable=False)          # full date; year ignored for logic
+    last_completed_year = Column(Integer, nullable=True)
 
 engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
-# =====================
-# COMMANDS
-# =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hi! Send /setbirthday YYYY-MM-DD to register your birthday."
-    )
+# --- Helpers ---
+def birthday_this_year(bd: date, today: date) -> date:
+    # Handles Feb 29 by falling back to Feb 28 on non-leap years
+    y = today.year
+    try:
+        return date(y, bd.month, bd.day)
+    except ValueError:
+        return date(y, 2, 28)
+
+# --- Commands ---
+async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Use /setbirthday YYYY-MM-DD, /mytask, /done, /summary (admin).")
 
 async def set_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    session = Session()
+    if len(context.args) != 1:
+        return await update.message.reply_text("Usage: /setbirthday YYYY-MM-DD")
     try:
-        if len(context.args) != 1:
-            await update.message.reply_text("Usage: /setbirthday YYYY-MM-DD")
-            return
-
-        birthday = datetime.strptime(context.args[0], "%Y-%m-%d").date()
-
-        user = session.query(User).filter_by(chat_id=update.effective_chat.id).first()
-        if user:
-            user.birthday = birthday
-            user.task_done = False
-        else:
-            user = User(chat_id=update.effective_chat.id, birthday=birthday)
-            session.add(user)
-
-        session.commit()
-        await update.message.reply_text(
-            f"Birthday set to {birthday}. Reminders will start 100 days before."
-        )
-
+        bd = datetime.strptime(context.args[0], "%Y-%m-%d").date()
     except ValueError:
-        await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
-    finally:
-        session.close()
-
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    session = Session()
-    user = session.query(User).filter_by(chat_id=update.effective_chat.id).first()
+        return await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
+    s = Session()
+    user = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
     if user:
-        user.task_done = True
-        session.commit()
-        await update.message.reply_text("Great! Task marked as done. No more reminders.")
+        user.birthday = bd
+        # do not reset last_completed_year here
     else:
-        await update.message.reply_text("You haven't set your birthday yet.")
-    session.close()
+        s.add(User(chat_id=update.effective_chat.id, birthday=bd))
+    s.commit(); s.close()
+    await update.message.reply_text(f"Birthday set to {bd}. IPPT window: 100 days after each birthday.")
 
-async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a summary of users and task status to the admin."""
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("You are not authorized to view this summary.")
-        return
-
-    session = Session()
-    total_users = session.query(User).count()
-    pending_tasks = session.query(User).filter_by(task_done=False).count()
-    upcoming_30_days = session.query(User).filter(
-        (User.birthday - datetime.now().date()).between(0, 30)
-    ).all()
-
-    msg = f"📊 Summary:\n"
-    msg += f"Total Users: {total_users}\n"
-    msg += f"Pending Tasks: {pending_tasks}\n"
-    msg += "Users with birthdays in next 30 days:\n"
-
-    if upcoming_30_days:
-        for user in upcoming_30_days:
-            days_left = (user.birthday - datetime.now().date()).days
-            msg += f"- {user.chat_id} ({user.birthday}, {days_left} days left)\n"
-    else:
-        msg += "None"
-
-    await update.message.reply_text(msg)
-    session.close()
-
-async def mytask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send the user their own task status."""
-    session = Session()
-    user = session.query(User).filter_by(chat_id=update.effective_chat.id).first()
-
+async def done(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    s = Session()
+    user = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
     if not user:
-        await update.message.reply_text(
-            "You haven't set your birthday yet. Use /setbirthday YYYY-MM-DD to register."
-        )
-        session.close()
+        s.close(); return await update.message.reply_text("Set your birthday first: /setbirthday YYYY-MM-DD")
+    user.last_completed_year = datetime.now().year
+    s.commit(); s.close()
+    await update.message.reply_text("IPPT marked completed for this year. Reminders stopped.")
+
+async def mytask(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    s = Session()
+    user = s.query(User).filter_by(chat_id=update.effective_chat.id).first()
+    if not user:
+        s.close(); return await update.message.reply_text("Set your birthday: /setbirthday YYYY-MM-DD")
+    today = datetime.now().date()
+    bdy = birthday_this_year(user.birthday, today)
+    days_since = (today - bdy).days
+    if user.last_completed_year == today.year:
+        status = "✅ Completed this year."
+    elif 0 <= days_since <= 100:
+        status = f"❌ Pending. {100 - days_since} days left."
+    elif days_since < 0:
+        status = "❌ Pending. Window not started yet."
+    else:
+        status = "❌ Pending. Window expired."
+    s.close()
+    await update.message.reply_text(f"Birthday: {user.birthday}  •  {status}")
+
+async def summary(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
         return
+    s = Session(); today = datetime.now().date()
+    rows = s.query(User).all()
+    pending = []
+    for u in rows:
+        bdy = birthday_this_year(u.birthday, today)
+        days_since = (today - bdy).days
+        if u.last_completed_year != today.year and 0 <= days_since <= 100:
+            pending.append(f"{u.chat_id}: {100 - days_since} days left (BD {u.birthday})")
+    s.close()
+    if not pending:
+        await update.message.reply_text("No users in active 100-day window.")
+    else:
+        await update.message.reply_text("Pending (within 100 days after birthday):\n" + "\n".join(pending))
 
-    today = datetime.now().date()
-    days_left = (user.birthday - today).days
-    status = "✅ Completed" if user.task_done else "❌ Pending"
-
-    msg = f"📋 Your Task Status:\n"
-    msg += f"Birthday: {user.birthday}\n"
-    msg += f"Days until birthday: {days_left}\n"
-    msg += f"Task Status: {status}"
-
-    await update.message.reply_text(msg)
-    session.close()
-
-# =====================
-# JOB FUNCTIONS
-# =====================
-async def send_reminders(app: ApplicationBuilder):
-    session = Session()
-    today = datetime.now().date()
-    for user in session.query(User).filter_by(task_done=False).all():
-        reminder_start = user.birthday - timedelta(days=100)
-        if reminder_start <= today <= user.birthday:
-            days_left = (user.birthday - today).days
-            if days_left % 10 == 0:
+# --- Scheduled jobs ---
+async def send_reminders(app):
+    s = Session(); today = datetime.now().date()
+    for u in s.query(User).all():
+        if u.last_completed_year == today.year:
+            continue
+        bdy = birthday_this_year(u.birthday, today)
+        days_since = (today - bdy).days
+        if 0 <= days_since <= 100:
+            days_left = 100 - days_since
+            if days_left % 10 == 0 or days_left == 100:  # 100,90,...,0
                 try:
                     await app.bot.send_message(
-                        chat_id=user.chat_id,
-                        text=f"Reminder: {days_left} days left to complete your task! Send /done when finished.",
+                        chat_id=u.chat_id,
+                        text=f"IPPT reminder: {days_left} days left to complete this year's IPPT. Send /done when finished."
                     )
                 except Exception as e:
-                    logging.error(f"Failed to send reminder to {user.chat_id}: {e}")
-    session.close()
+                    logging.warning(f"Notify fail {u.chat_id}: {e}")
+    s.close()
 
-async def send_admin_report(app: ApplicationBuilder):
-    session = Session()
-    today = datetime.now().date()
-    report_users = []
-    for user in session.query(User).filter_by(task_done=False).all():
-        if timedelta(days=0) <= (user.birthday - today) <= timedelta(days=30):
-            report_users.append(f"User {user.chat_id} - Birthday: {user.birthday}")
-
-    if report_users:
+async def send_admin_report(app):
+    s = Session(); today = datetime.now().date()
+    report = []
+    for u in s.query(User).all():
+        if u.last_completed_year == today.year:
+            continue
+        bdy = birthday_this_year(u.birthday, today)
+        days_since = (today - bdy).days
+        if 0 <= days_since <= 30:
+            report.append(f"{u.chat_id} (BD {u.birthday}, {30 - days_since}d of first 30)")
+    s.close()
+    if report:
         try:
-            await app.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text="📋 Pending tasks (within 30 days):\n" + "\n".join(report_users),
-            )
+            await app.bot.send_message(ADMIN_CHAT_ID, "Within first 30 days after birthday:\n" + "\n".join(report))
         except Exception as e:
-            logging.error(f"Failed to send admin report: {e}")
-    session.close()
+            logging.warning(f"Admin report fail: {e}")
 
-# =====================
-# MAIN
-# =====================
+# --- Main ---
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setbirthday", set_birthday))
     app.add_handler(CommandHandler("done", done))
-    app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("mytask", mytask))
+    app.add_handler(CommandHandler("summary", summary))
 
-    # Start APScheduler
     scheduler = BackgroundScheduler()
-    from asyncio import get_event_loop
     loop = get_event_loop()
-
-    # Schedule daily jobs
-    scheduler.add_job(lambda: loop.create_task(send_reminders(app)), 'interval', days=1)
-    scheduler.add_job(lambda: loop.create_task(send_admin_report(app)), 'interval', days=1)
+    scheduler.add_job(lambda: loop.create_task(send_reminders(app)), "interval", days=1)
+    scheduler.add_job(lambda: loop.create_task(send_admin_report(app)), "interval", days=1)
     scheduler.start()
     logging.info("Scheduler started.")
-
-    # Run bot
     app.run_polling()
 
 if __name__ == "__main__":
