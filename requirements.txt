@@ -1,4 +1,6 @@
+# requirements.txt
 python-telegram-bot==20.6
 apscheduler==3.10.4
 SQLAlchemy==2.0.21
 psycopg2-binary==2.9.7
+
