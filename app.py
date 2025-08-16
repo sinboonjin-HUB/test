@@ -484,8 +484,7 @@ def setup_handlers(app: Application):
     app.add_handler(CommandHandler("whoami", whoami))
 
     # CSV upload after /import_csv
-    app.add_handler(MessageHandler(filters.Document.FileExtension("csv") | filters.Document.FileExtension("xlsx")),
-        import_csv_file,))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("csv"), import_csv_file))
 
 def schedule_jobs(app: Application):
     # Schedule daily reminder at 09:00 local time
