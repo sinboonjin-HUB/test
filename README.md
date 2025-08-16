@@ -1,73 +1,50 @@
-# IPPT Reminder Telegram Bot — 100‑day Window + Reason‑only Deferments
+# IPPT Reminder Telegram Bot (100-day window)
 
-- **Window:** from birthday (inclusive) to **birthday + 100 days** (inclusive).
-- **Status categories:** Completed / 0–100 days left to complete / Overdue by N days / Defer.
-- **Deferments:** reason‑only (user `/defer`, admin `/defer_reason`) — active immediately, pauses reminders.
-- **Report:** Excel (.xlsx) with `days_left` / `days_overdue` and red rows for “not completed & no active deferment”.
-- **Groups:** optional `group` column in CSV/XLSX and `/add_personnel`.
-- **Imports:** CSV/XLSX, BOM‑safe, extra columns ignored.
+Features:
+- Public verification against admin-loaded personnel DB (ID + birthday).
+- Reminders from **birthday → +100 days** (inclusive), every `REMINDER_INTERVAL_DAYS` (default 10).
+- Users can mark complete: `/complete [YYYY-MM-DD]` (date must be within the *current* window).
+- **Admins only** can set deferment reasons, reset deferments, complete on behalf (with date override), uncomplete, edit birthdays, import CSV/XLSX, and export reports.
+- Deferments are tied to **personnel_id** (not Telegram ID). Completion & deferment **auto-reset at window end**.
+- `/status` shows:
+  - ✅ Completed
+  - ⛔️ Defer — <reason>
+  - ⏳ N day(s) left (while in window)
+  - 💤 Window not open yet — starts <date> (before window)
+  - **Window closed — next window starts <date>** (after window)
 
-## Commands
+## Quick deploy (Railway)
 
-**User**
-- `/verify <PERSONNEL_ID> <YYYY-MM-DD>`
-- `/status` (shows IPPT Status with days left/overdue)
-- `/complete`
-- `/uncomplete`
-- `/defer <reason>`
+1. Create a new service from this repo/ZIP.
+2. Add **Environment Variables**:
+   - `BOT_TOKEN` – your Telegram bot token
+   - `ADMIN_IDS` – comma-separated Telegram user IDs (e.g. `123,456`)
+   - `DB_PATH` – `/data/ippt.db`
+   - `TZ` – `Asia/Singapore`
+   - `REMINDER_INTERVAL_DAYS` – `10` (optional)
+3. Add a **Volume** and mount to `/data`.
+4. Deploy.
 
-**Admin**
-- `/admin_help`
+## CSV/XLSX import
+- Use `/import_csv`, then upload a file `personnel_id,birthday[,group]` (ignores extra columns, BOM-safe; `.csv` or `.xlsx`).
+- Dates must be `YYYY-MM-DD`.
+
+## Reports
+- `/report` → Excel with **All** sheet + one sheet per group (red rows = not completed & no deferment).
+- `/report_group <GROUP>` → single sheet export.
+
+## Admin commands
+- `/admin_help` – show all admin commands.
 - `/add_personnel <ID> <YYYY-MM-DD> [GROUP]`
-- `/import_csv` then upload .csv/.xlsx with `personnel_id,birthday[,group]`
-- `/report` (Excel with red highlight)
-- `/whoami`
-- `/unlink_user <tokens>` (Telegram IDs **or** `personnel_id`s, mixed, multi)
-- `/remove_personnel <ID or list>`
-- `/admin_uncomplete <tokens> [WINDOW_START_YEAR]`
-- `/defer_reason <tokens> [WINDOW_START_YEAR] -- <reason text>`  (sets active deferment)
+- `/update_birthday <PERSONNEL_ID> <YYYY-MM-DD>`
+- `/defer_reason <tokens> [YEAR] -- <reason>`
+- `/defer_reset <tokens> [YEAR]`
+- `/admin_complete <tokens> [YEAR] [--date YYYY-MM-DD]` *(overrides completion date for that window)*
+- `/admin_uncomplete <tokens> [YEAR]`
+- `/unlink_user <tokens>`
+- `/remove_personnel <ID or comma-list>`
+- `/import_csv` then upload CSV/XLSX
+- `/report`, `/report_group <GROUP>`
+- `/defer_audit` – CSV of migrated (if any) + current deferments
 
-## Deploy (Railway)
-1) Set env: `BOT_TOKEN`, `ADMIN_IDS`, `TZ=Asia/Singapore`, `DB_PATH=/data/ippt.db`, `REMINDER_INTERVAL_DAYS=10`.
-2) Add a Volume and mount at `/data`.
-3) Deploy.
-
-
-## Impact on existing data
-If you previously saved completions using the **calendar year**, the bot now expects
-`completed_year` to equal the **window’s start year** (the year of the birthday in that window).
-Example: Birthday Dec 15 → window starts **Dec 15, 2024** and ends **Mar 25, 2025**. A completion on
-Jan 10, 2025 belongs to **2024**.
-
-Use the migration script to align your data:
-
-**Dry-run (no writes)**
-
-```bash
-# DB path from env
-DB_PATH=/data/ippt.db python scripts/migrate_years.py
-# or specify explicitly
-python scripts/migrate_years.py --db /data/ippt.db
-```
-
-**Apply changes**
-
-```bash
-DB_PATH=/data/ippt.db python scripts/migrate_years.py --apply
-# or
-python scripts/migrate_years.py --db /data/ippt.db --apply
-```
-
-On Railway, run a one-off command for your service (with the Volume mounted at /data):
-
-```bash
-python scripts/migrate_years.py --apply
-```
-
-
-### New features
-- `/report` now produces **one sheet per group** plus an **All** sheet.
-- Users **cannot** submit deferment reasons; only admins can via `/defer_reason`.
-- Admins can update birthdays with `/update_birthday <PERSONNEL_ID> <YYYY-MM-DD>`.
-
-- New: `/report_group <GROUP>` exports a single Excel report for the specified group (case-insensitive). Use `No Group` for empty groups.
+*Tokens can be Telegram IDs or personnel IDs (mixed; comma/space separated).*
