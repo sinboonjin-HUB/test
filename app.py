@@ -1,4 +1,3 @@
-import asyncio
 import csv
 import io
 import os
@@ -361,7 +360,9 @@ async def import_csv_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"Import done. ✅ Added: {added} | ⏭️ Skipped: {skipped}")
 
-
+# ----------------------
+# Reports
+# ----------------------
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not is_admin(msg.from_user.id):
@@ -500,9 +501,9 @@ def schedule_jobs(app: Application):
     )
 
 
-async def main():
+def main():
     init_db()
-    app: Application = (
+    app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
@@ -513,11 +514,9 @@ async def main():
     schedule_jobs(app)
 
     print("Bot is running…")
-    await app.run_polling()
+    # Blocking call; PTB manages its own event loop internally.
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    main()
