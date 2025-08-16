@@ -1,3 +1,4 @@
+
 import os
 import io
 import re
@@ -32,7 +33,8 @@ def init_db():
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         # Personnel registry
-        cur.execute("""            CREATE TABLE IF NOT EXISTS personnel (
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS personnel (
               personnel_id TEXT PRIMARY KEY,
               birthday     TEXT NOT NULL,        -- YYYY-MM-DD
               group_name   TEXT
@@ -40,7 +42,8 @@ def init_db():
         """)
 
         # Verified Telegram users mapped to personnel_id (one-to-one)
-        cur.execute("""            CREATE TABLE IF NOT EXISTS users (
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
               telegram_id     INTEGER PRIMARY KEY,
               personnel_id    TEXT UNIQUE,
               verified_at     TEXT,
@@ -51,7 +54,8 @@ def init_db():
         """)
 
         # Completion audit (per window/cycle)
-        cur.execute("""            CREATE TABLE IF NOT EXISTS completions (
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS completions (
               id            INTEGER PRIMARY KEY AUTOINCREMENT,
               telegram_id   INTEGER NOT NULL,
               year          INTEGER NOT NULL,      -- window (start) year
@@ -60,7 +64,8 @@ def init_db():
         """)
 
         # Deferments keyed by personnel_id + window year (admin-only)
-        cur.execute("""            CREATE TABLE IF NOT EXISTS deferments (
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS deferments (
               id           INTEGER PRIMARY KEY AUTOINCREMENT,
               personnel_id TEXT NOT NULL,
               year         INTEGER NOT NULL,
@@ -73,7 +78,8 @@ def init_db():
         """)
 
         # Optional audit table if you ever migrated older deferments
-        cur.execute("""            CREATE TABLE IF NOT EXISTS deferment_migration_audit (
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS deferment_migration_audit (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               old_telegram_id INTEGER,
               new_personnel_id TEXT,
@@ -86,7 +92,8 @@ def init_db():
         """)
 
         # Cycle notes: admin explanation for not-completed cycle (birthday->next birthday)
-        cur.execute("""            CREATE TABLE IF NOT EXISTS cycle_notes (
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cycle_notes (
               id           INTEGER PRIMARY KEY AUTOINCREMENT,
               personnel_id TEXT NOT NULL,
               year         INTEGER NOT NULL,    -- cycle start year
@@ -127,7 +134,8 @@ def cycle_for_date(bday: date, on: date):
     return start, end_excl
 
 def today_in_window(bday: date, today: date):
-    """    Returns (in_window, start, end) where start is the birthday for the relevant year
+    """
+    Returns (in_window, start, end) where start is the birthday for the relevant year
     and end = start + WINDOW_DAYS.
     If not in current-year window, check last year's window (in case today is early-year).
     """
@@ -170,12 +178,14 @@ def is_admin(tid: int) -> bool:
 def get_personnel_and_user(conn: sqlite3.Connection, telegram_id: int):
     cur = conn.cursor()
     cur.execute(
-        """        SELECT u.telegram_id, u.personnel_id, u.verified_at, u.completed_year, u.completed_at,
+        """
+        SELECT u.telegram_id, u.personnel_id, u.verified_at, u.completed_year, u.completed_at,
                p.birthday, p.group_name
           FROM users u
           JOIN personnel p ON u.personnel_id = p.personnel_id
          WHERE u.telegram_id = ?
-        """,        (telegram_id,),
+        """,
+        (telegram_id,),
     )
     r = cur.fetchone()
     if not r:
@@ -210,7 +220,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /add_personnel <ID> <YYYY-MM-DD> [GROUP]\n"
         "• /update_birthday <PERSONNEL_ID> <YYYY-MM-DD>\n"
         "• /import_csv  (then upload CSV/XLSX: personnel_id,birthday[,group])\n"
-        "• /report      (All + per-group + Cycles_19_40; red rows = not completed & no deferment)\n"
+        "• /report      (All + per-group + Cycles_19_40; red=overdue, yellow=<100 days; deferment=no color)\n"
         "• /defer_reason  <tokens> [YEAR] -- <reason>\n"
         "• /defer_reset   <tokens> [YEAR]\n"
         "• /admin_complete   <tokens> [YEAR] [--date YYYY-MM-DD]  (or bare YYYY-MM-DD)\n"
@@ -250,12 +260,14 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r[0] != format_date(dob):
             return await update.message.reply_text("Birthday does not match our records.")
         cur.execute(
-            """            INSERT INTO users (telegram_id, personnel_id, verified_at)
+            """
+            INSERT INTO users (telegram_id, personnel_id, verified_at)
             VALUES (?, ?, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET
               personnel_id=excluded.personnel_id,
               verified_at=excluded.verified_at
-            """,            (update.message.from_user.id, pid, datetime.now(TZINFO).isoformat())
+            """,
+            (update.message.from_user.id, pid, datetime.now(TZINFO).isoformat())
         )
         conn.commit()
     await update.message.reply_text("✅ Verified and linked. Use /status.")
@@ -411,10 +423,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         cur.execute(
-            """            SELECT completed_at FROM completions
+            """
+            SELECT completed_at FROM completions
              WHERE telegram_id=? AND completed_at >= ? AND completed_at <= ?
              ORDER BY completed_at DESC LIMIT 1
-            """,            (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(window_end, 23, 59)),
+            """,
+            (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(window_end, 23, 59)),
         )
         row_win = cur.fetchone()
     completed_in_window_date = datetime.fromisoformat(row_win[0]).date() if row_win else None
@@ -425,10 +439,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with closing(db_connect()) as conn:
             cur = conn.cursor()
             cur.execute(
-                """                SELECT completed_at FROM completions
+                """
+                SELECT completed_at FROM completions
                  WHERE telegram_id=? AND completed_at >= ? AND completed_at < ?
                  ORDER BY completed_at DESC LIMIT 1
-                """,                (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(cycle_end_excl - timedelta(days=1), 23, 59)),
+                """,
+                (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(cycle_end_excl - timedelta(days=1), 23, 59)),
             )
             row_cyc = cur.fetchone()
         completed_in_cycle_date = datetime.fromisoformat(row_cyc[0]).date() if row_cyc else None
@@ -459,16 +475,18 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             status_line = f"IPPT Status: Window closed — next window starts {format_date(next_start)}"
 
-    # (Optional) cycle summary for *today's* cycle
+    # Cycle summary for today's cycle
     cycle_today_start, cycle_today_end_excl = cycle_for_date(bday, today)
     cycle_window_end_today = cycle_today_start + timedelta(days=WINDOW_DAYS)
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         cur.execute(
-            """            SELECT completed_at FROM completions
+            """
+            SELECT completed_at FROM completions
              WHERE telegram_id=? AND completed_at >= ? AND completed_at < ?
              ORDER BY completed_at DESC LIMIT 1
-            """,            (tid, iso_from_local_date(cycle_today_start, 0, 0), iso_from_local_date(cycle_today_end_excl - timedelta(days=1), 23, 59)),
+            """,
+            (tid, iso_from_local_date(cycle_today_start, 0, 0), iso_from_local_date(cycle_today_end_excl - timedelta(days=1), 23, 59)),
         )
         r = cur.fetchone()
     if r:
@@ -480,11 +498,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         cycle_line = "Cycle status: Not completed"
 
-    # Assemble message
     lines = [
         status_line,
         f"Window: {format_date(start)} → {format_date(end)}",
-        window_result_line,  # <-- explicit 100-day result
+        window_result_line,
         cycle_line,
         f"Today:  {format_date(today)}",
     ]
@@ -534,13 +551,11 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"(Window end: {format_date(end)}; date recorded: {format_date(completion_date)})"
     )
 
-# ----- user uncomplete: allowed ONLY within the active 100-day window -----
 async def uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     tid = msg.from_user.id
     today = current_local_date()
 
-    # Must be verified
     with closing(db_connect()) as conn:
         data = get_personnel_and_user(conn, tid)
     if not data or not data[1]:
@@ -549,7 +564,6 @@ async def uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, _, _, _, _, birthday_str, _ = data
     bday = parse_date_strict(birthday_str)
 
-    # Must be inside the active window to allow uncomplete
     in_window, start, end = today_in_window(bday, today)
     if not in_window:
         return await msg.reply_text(
@@ -560,7 +574,6 @@ async def uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     window_key = start.year
 
-    # Clear only if the current-window completion is set
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -638,7 +651,7 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tail = (tail[:m.start()] + tail[m.end():]).strip()
 
     # 2) Split tokens (IDs, optional YEAR, maybe bare date)
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
 
     # 3) If no --date, accept a bare YYYY-MM-DD anywhere
     if date_override is None:
@@ -648,7 +661,6 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 date_override = parse_date_strict(tokens[date_idx])
             except Exception:
                 return await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
-            # Remove the date token from IDs list
             tokens.pop(date_idx)
 
     # 4) Optional YEAR (only used if no date was provided)
@@ -660,7 +672,6 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tokens:
         return await update.message.reply_text("No IDs provided.")
 
-    # Resolve targets: tokens may be personnel_ids or Telegram IDs
     tids = await _resolve_tokens_to_tids(tokens)
     if not tids:
         return await update.message.reply_text("No verified users matched these tokens.")
@@ -670,7 +681,6 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         for tid in tids:
-            # Pull birthday
             cur.execute(
                 "SELECT p.birthday FROM users u JOIN personnel p ON u.personnel_id=p.personnel_id WHERE u.telegram_id=?",
                 (tid,),
@@ -680,7 +690,6 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             bday = parse_date_strict(r[0])
 
-            # Decide target window year + completion timestamp
             if date_override is not None:
                 cstart, cend_excl = cycle_for_date(bday, date_override)
                 if not (cstart <= date_override < cend_excl):
@@ -698,7 +707,6 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     target_year = start.year
                 completion_iso = datetime.now(TZINFO).isoformat()
 
-            # Upsert into users + completions (overwrite same year)
             cur.execute(
                 "UPDATE users SET completed_year=?, completed_at=? WHERE telegram_id=?",
                 (target_year, completion_iso, tid),
@@ -712,7 +720,6 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             replaced += 1
         conn.commit()
 
-    # Note on precedence
     note = " (date took precedence over YEAR)" if date_override is not None else ""
     return await update.message.reply_text(
         f"✅ Admin completed. Users updated: {updated}, history rows replaced: {replaced}.{note}"
@@ -725,7 +732,7 @@ async def admin_uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /admin_uncomplete <tokens> [YEAR]")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
     if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
@@ -766,7 +773,7 @@ async def defer_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /defer_reason <tokens> [YEAR] -- <reason>")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
     if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
@@ -788,12 +795,14 @@ async def defer_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 start, _ = window_for_date(bday, current_local_date())
                 win_year = start.year
             cur.execute(
-                """                INSERT INTO deferments (personnel_id, year, reason, status, created_at)
+                """
+                INSERT INTO deferments (personnel_id, year, reason, status, created_at)
                 VALUES (?, ?, ?, 'approved', ?)
                 ON CONFLICT(personnel_id, year) DO UPDATE SET
                   reason=excluded.reason,
                   status='approved'
-                """,                (pid, win_year, reason.strip(), now),
+                """,
+                (pid, win_year, reason.strip(), now),
             )
         conn.commit()
     await update.message.reply_text(f"📝 Reason set for {len(pids)} user(s).")
@@ -805,7 +814,7 @@ async def defer_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /defer_reset <tokens> [YEAR]")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
     if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
@@ -842,7 +851,7 @@ async def cycle_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /cycle_reason <tokens> [YEAR] -- <reason>")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
     if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
@@ -863,10 +872,12 @@ async def cycle_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 start, _ = cycle_for_date(bday, current_local_date())
                 cyc_year = start.year
             cur.execute(
-                """                INSERT INTO cycle_notes (personnel_id, year, reason, created_at)
+                """
+                INSERT INTO cycle_notes (personnel_id, year, reason, created_at)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(personnel_id, year) DO UPDATE SET reason=excluded.reason
-                """,                (pid, cyc_year, reason.strip(), now),
+                """,
+                (pid, cyc_year, reason.strip(), now),
             )
         conn.commit()
     await update.message.reply_text(f"📝 Cycle reason recorded for {len(pids)} user(s).")
@@ -878,7 +889,7 @@ async def cycle_reason_clear(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /cycle_reason_clear <tokens> [YEAR]")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
     if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
@@ -911,7 +922,7 @@ async def unlink_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split(maxsplit=1)
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /unlink_user <tokens>")
-    tokens = [t for t in re.split(r"[,\s]+", parts[1]) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", parts[1]) if t]
 
     cleared = 0
     with closing(db_connect()) as conn:
@@ -938,7 +949,7 @@ async def remove_personnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split(maxsplit=1)
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /remove_personnel <ID[,ID,...]>")
-    tokens = [t.strip() for t in re.split(r"[,\s]+", parts[1]) if t.strip()]
+    tokens = [t.strip() for t in re.split(r"[,\\s]+", parts[1]) if t.strip()]
 
     removed = 0
     with closing(db_connect()) as conn:
@@ -968,12 +979,12 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with closing(db_connect()) as conn:
         cur = conn.cursor()
-        cur.execute(
-            """            SELECT p.personnel_id, p.birthday, p.group_name,
+        cur.execute("""
+            SELECT p.personnel_id, p.birthday, p.group_name,
                    u.telegram_id, u.completed_year, u.completed_at
               FROM personnel p
               LEFT JOIN users u ON p.personnel_id = u.personnel_id
-            """        )
+        """)
         rows = cur.fetchall()
 
     def build_current_row(pid, bday_str, group_name, telegram_id, completed_year, completed_at):
@@ -996,10 +1007,12 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with closing(db_connect()) as conn2:
                 c2 = conn2.cursor()
                 c2.execute(
-                    """                    SELECT completed_at FROM completions
+                    """
+                    SELECT completed_at FROM completions
                      WHERE telegram_id=? AND completed_at >= ? AND completed_at < ?
                      ORDER BY completed_at DESC LIMIT 1
-                    """,                    (telegram_id, iso_from_local_date(cyc_start, 0, 0), iso_from_local_date(cyc_end_excl - timedelta(days=1), 23, 59)),
+                    """,
+                    (telegram_id, iso_from_local_date(cyc_start, 0, 0), iso_from_local_date(cyc_end_excl - timedelta(days=1), 23, 59)),
                 )
                 r = c2.fetchone()
                 if r:
@@ -1030,6 +1043,10 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 days_left, days_overdue = "", (today - end).days
 
+        # Highlight flags
+        highlight_red = (d_status != "approved") and (not done) and (today > end)
+        highlight_yellow = (d_status != "approved") and (not done) and (start <= today <= end)
+
         return {
             "personnel_id": pid,
             "birthday": bday_str,
@@ -1045,7 +1062,8 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "days_overdue": days_overdue,
             "cycle_status": cycle_status,
             "cycle_overdue_days": cycle_overdue_days,
-            "_highlight_red": (not done) and (d_status != "approved"),
+            "_highlight_red": highlight_red,
+            "_highlight_yellow": highlight_yellow,
         }
 
     data_rows = [build_current_row(*r) for r in rows]
@@ -1066,11 +1084,19 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for c in ws_all[1]:
         c.font = Font(bold=True)
 
+    RED_FILL    = PatternFill(start_color="FFFFC0C0", end_color="FFFFC0C0", fill_type="solid")
+    YELLOW_FILL = PatternFill(start_color="FFFFFF99", end_color="FFFFFF99", fill_type="solid")
+
     def write_row(ws, rec):
         ws.append([rec[h] for h in headers_all])
-        if rec["_highlight_red"]:
+        fill = None
+        if rec.get("_highlight_red"):
+            fill = RED_FILL
+        elif rec.get("_highlight_yellow"):
+            fill = YELLOW_FILL
+        if fill:
             for cell in ws[ws.max_row]:
-                cell.fill = PatternFill(start_color="FFFFC0C0", end_color="FFFFC0C0", fill_type="solid")
+                cell.fill = fill
 
     for rec in data_rows:
         write_row(ws_all, rec)
@@ -1153,7 +1179,6 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             overdue_days = ""
             completed_at_out = ""
             note = ""
-
             if telegram_id and int(telegram_id) in compl:
                 best = None
                 for d, iso in compl[int(telegram_id)]:
@@ -1207,7 +1232,6 @@ async def defer_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     writer.writerow(["source","personnel_id","year","reason","status","created_at","group_name","linked_telegram_ids","old_telegram_id"])
     with closing(db_connect()) as conn:
         cur = conn.cursor()
-        # migrated (if any)
         try:
             cur.execute("SELECT new_personnel_id, year, reason, status, created_at, old_telegram_id FROM deferment_migration_audit ORDER BY year, new_personnel_id")
             migrated = cur.fetchall()
@@ -1218,13 +1242,12 @@ async def defer_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur2.execute("SELECT group_name FROM personnel WHERE personnel_id=?", (pid,))
             g = cur2.fetchone()
             writer.writerow(["migrated", pid, yr, reason or "", status or "", created_at or "", (g[0] if g and g[0] else ""), "", old_tid or ""])
-        # current
-        cur.execute(
-            """            SELECT d.personnel_id, d.year, d.reason, d.status, d.created_at, p.group_name
+        cur.execute("""
+            SELECT d.personnel_id, d.year, d.reason, d.status, d.created_at, p.group_name
               FROM deferments d
               LEFT JOIN personnel p ON p.personnel_id = d.personnel_id
              ORDER BY d.year, d.personnel_id
-            """        )
+        """)
         for pid, yr, reason, status, created_at, group_name in cur.fetchall():
             cur2 = conn.cursor()
             cur2.execute("SELECT telegram_id FROM users WHERE personnel_id=?", (pid,))
@@ -1240,11 +1263,11 @@ async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     today = current_local_date()
     with closing(db_connect()) as conn:
         cur = conn.cursor()
-        cur.execute(
-            """            SELECT u.telegram_id, u.personnel_id, p.birthday, u.completed_year
+        cur.execute("""
+            SELECT u.telegram_id, u.personnel_id, p.birthday, u.completed_year
               FROM users u
               JOIN personnel p ON u.personnel_id = p.personnel_id
-            """        )
+        """)
         rows = cur.fetchall()
 
     for telegram_id, pid, bday_str, completed_year in rows:
@@ -1330,7 +1353,6 @@ def main():
     setup_handlers(app)
     schedule_jobs(app)
     print("Bot is running…")
-    # close_loop=False avoids issues on some hosting providers
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
