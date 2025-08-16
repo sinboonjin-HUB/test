@@ -1268,18 +1268,37 @@ async def admin_uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
 async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: mark completion for users identified by tokens (Telegram IDs or personnel_id). Optional [WINDOW_START_YEAR]."""
+    """Admin: mark completion for users identified by tokens (Telegram IDs or personnel_id).
+    Usage:
+      /admin_complete <tokens> [WINDOW_START_YEAR] [--date YYYY-MM-DD]
+    Notes:
+      - If --date is provided, it determines the window year from each user's birthday (YEAR arg is ignored).
+      - If neither YEAR nor --date is provided, the current window (by *today*) is used.
+    """
     if not is_admin(update.message.from_user.id):
         return await update.message.reply_text("Admins only.")
     parts = update.message.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await update.message.reply_text("Usage: /admin_complete <tokens> [WINDOW_START_YEAR]")
+        return await update.message.reply_text("Usage: /admin_complete <tokens> [WINDOW_START_YEAR] [--date YYYY-MM-DD]")
+
     tail = parts[1].strip()
+
+    # Extract --date if present
+    m = re.search(r"--date\s+(\d{4}-\d{2}-\d{2})", tail)
+    date_override = None
+    if m:
+        try:
+            date_override = parse_date_strict(m.group(1))
+        except Exception:
+            return await update.message.reply_text("Invalid --date. Use YYYY-MM-DD.")
+        tail = (tail[:m.start()] + tail[m.end():]).strip()
+
     tokens = [t for t in re.split(r'[,\s]+', tail) if t]
 
     year = None
-    if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
+    if tokens and re.fullmatch(r"\d{4}", tokens[-1] or "") and date_override is None:
         year = int(tokens[-1]); tokens = tokens[:-1]
     if not tokens:
         return await update.message.reply_text("No IDs provided.")
@@ -1288,26 +1307,40 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tids:
         return await update.message.reply_text("No verified users matched these tokens.")
 
-    now_iso = datetime.now(TZINFO).isoformat()
     updated = 0
     inserted = 0
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         for tid in tids:
-            target_year = year
-            if target_year is None:
+            if date_override is not None:
                 cur.execute("SELECT p.birthday FROM users u JOIN personnel p ON u.personnel_id=p.personnel_id WHERE u.telegram_id=?", (tid,))
                 r = cur.fetchone()
                 if not r:
                     continue
                 bday = parse_date_strict(r[0])
-                start, _ = window_for_date(bday, current_local_date())
-                target_year = start.year
+                start_by_date, end_by_date = window_for_date(bday, date_override)
+                if not (start_by_date <= date_override <= end_by_date):
+                    return await update.message.reply_text(f"--date {date_override} is not within the 100-day window for at least one user.")
+                target_year = start_by_date.year
+                completion_iso = iso_from_local_date(date_override, hour=9, minute=0)
+            else:
+                cur.execute("SELECT p.birthday FROM users u JOIN personnel p ON u.personnel_id=p.personnel_id WHERE u.telegram_id=?", (tid,))
+                r = cur.fetchone()
+                if not r:
+                    continue
+                bday = parse_date_strict(r[0])
+                if year is None:
+                    _, start, _ = today_in_window(bday, current_local_date())
+                    target_year = start.year
+                else:
+                    start = adjusted_birthday_for_year(bday, year)
+                    target_year = start.year
+                completion_iso = datetime.now(TZINFO).isoformat()
 
-            cur.execute("UPDATE users SET completed_year=?, completed_at=? WHERE telegram_id=?", (target_year, now_iso, tid))
+            cur.execute("UPDATE users SET completed_year=?, completed_at=? WHERE telegram_id=?", (target_year, completion_iso, tid))
             updated += cur.rowcount
             try:
-                cur.execute("INSERT INTO completions (telegram_id, year, completed_at) VALUES (?, ?, ?)", (tid, target_year, now_iso))
+                cur.execute("INSERT INTO completions (telegram_id, year, completed_at) VALUES (?, ?, ?)", (tid, target_year, completion_iso))
                 inserted += 1
             except Exception:
                 pass
