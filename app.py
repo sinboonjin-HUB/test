@@ -12,7 +12,6 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes,
-    MessageHandler, filters, CallbackQueryHandler,
 )
 
 # =========================
@@ -21,9 +20,8 @@ from telegram.ext import (
 # Optional rate limiter (python-telegram-bot[rate-limiter])
 try:
     from telegram.ext import AIORateLimiter as _AIORateLimiter
-    _HAS_RL = True
 except Exception:
-    _HAS_RL = False
+    _AIORateLimiter = None
 
 # =========================
 # Logging
@@ -69,34 +67,30 @@ SET = Settings.from_env()
 # =========================
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS persons (
-    user_id INTEGER PRIMARY KEY,
-    chat_id INTEGER NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id TEXT UNIQUE NOT NULL,     -- your ID from the roster (e.g., 001A)
+    birthday TEXT NOT NULL,               -- ISO date YYYY-MM-DD (from your roster)
+    user_id INTEGER UNIQUE,               -- Telegram user who verified against this record
+    chat_id INTEGER,
     username TEXT,
     first_name TEXT,
     last_name TEXT,
-    birthday TEXT NOT NULL,         -- ISO date (YYYY-MM-DD) for month/day reference
-    completed_on TEXT,              -- ISO date when IPPT completed (year-specific)
-    last_reminded_at TEXT,          -- ISO datetime
+    display_name TEXT,                    -- user-set name via /setname
+    completed_on TEXT,                    -- ISO date when IPPT completed
+    last_reminded_at TEXT,                -- ISO datetime
+    verified_at TEXT,                     -- ISO datetime
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_persons_user_id ON persons(user_id);
+CREATE INDEX IF NOT EXISTS idx_persons_external_id ON persons(external_id);
 """
 
-# lightweight migrations
-MIGRATIONS = [
-    ("ALTER TABLE persons ADD COLUMN last_reminded_at TEXT", "last_reminded_at"),
-]
+# If migrating from earlier schema, you may need manual migration; this script assumes fresh or compatible DB.
 
 async def ensure_schema(db: aiosqlite.Connection) -> None:
     await db.executescript(SCHEMA)
-    cols = set()
-    async with db.execute("PRAGMA table_info(persons)") as cur:
-        async for row in cur:
-            cols.add(row[1])
-    for sql, col in MIGRATIONS:
-        if col not in cols:
-            log.info("Applying migration: add column %s", col)
-            await db.execute(sql)
     await db.commit()
 
 async def open_db() -> aiosqlite.Connection:
@@ -118,7 +112,7 @@ def today_sgt() -> date:
 def within_100_day_window(bday: date, ref: date) -> Tuple[bool, date, date]:
     """
     100-day window after the current-year birthday date.
-    Stored birthday uses true Y-M-D, but window keys off month/day each year.
+    'birthday' comes from admin-imported roster.
     """
     bday_this_year = bday.replace(year=ref.year)
     start = bday_this_year
@@ -137,50 +131,59 @@ def parse_date_arg(text: str) -> Optional[date]:
     except ValueError:
         return None
 
-def fmt_user(row) -> str:
-    name = (row["first_name"] or "") + (" " + row["last_name"] if row["last_name"] else "")
-    name = name.strip() or (row["username"] or f"u{row['user_id']}")
-    return name
-
 def is_admin(uid: int) -> bool:
     return uid in SET.ADMIN_IDS
+
+def require_verified(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with open_db() as db:
+            row = await get_person_by_user(db, update.effective_user.id)
+        if not row:
+            await update.effective_message.reply_text(
+                "You are not verified yet. Use:\n/verify <ID> <YYYY-MM-DD>\n"
+                "Example: /verify 001A 1997-05-03"
+            )
+            return
+        return await func(update, context)
+    return wrapper
 
 # =========================
 # Core DB Ops
 # =========================
-async def upsert_person(
+async def get_person_by_user(db: aiosqlite.Connection, user_id: int):
+    async with db.execute("SELECT * FROM persons WHERE user_id=?", (user_id,)) as cur:
+        return await cur.fetchone()
+
+async def get_person_by_external_and_bday(db: aiosqlite.Connection, external_id: str, bday: date):
+    async with db.execute(
+        "SELECT * FROM persons WHERE external_id=? AND birthday=?",
+        (external_id, bday.isoformat()),
+    ) as cur:
+        return await cur.fetchone()
+
+async def link_user_to_person(
     db: aiosqlite.Connection,
+    external_id: str,
     user_id: int,
     chat_id: int,
     username: Optional[str],
     first_name: Optional[str],
     last_name: Optional[str],
-) -> None:
+):
     now = datetime.utcnow().isoformat()
     await db.execute(
         """
-        INSERT INTO persons (user_id, chat_id, username, first_name, last_name, birthday, completed_on, last_reminded_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, COALESCE((SELECT birthday FROM persons WHERE user_id=?), '1970-01-01'),
-                COALESCE((SELECT completed_on FROM persons WHERE user_id=?), NULL),
-                COALESCE((SELECT last_reminded_at FROM persons WHERE user_id=?), NULL),
-                COALESCE((SELECT created_at FROM persons WHERE user_id=?), ?), ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          chat_id=excluded.chat_id,
-          username=excluded.username,
-          first_name=excluded.first_name,
-          last_name=excluded.last_name,
-          updated_at=excluded.updated_at
+        UPDATE persons
+        SET user_id=?,
+            chat_id=?,
+            username=?,
+            first_name=?,
+            last_name=?,
+            verified_at=?,
+            updated_at=?
+        WHERE external_id=?
         """,
-        (user_id, chat_id, username, first_name, last_name,
-         user_id, user_id, user_id, user_id, now, now)
-    )
-    await db.commit()
-
-async def set_birthday(db: aiosqlite.Connection, user_id: int, bday: date) -> None:
-    now = datetime.utcnow().isoformat()
-    await db.execute(
-        "UPDATE persons SET birthday=?, updated_at=? WHERE user_id=?",
-        (bday.isoformat(), now, user_id)
+        (user_id, chat_id, username, first_name, last_name, now, now, external_id),
     )
     await db.commit()
 
@@ -192,31 +195,29 @@ async def set_completed(db: aiosqlite.Connection, user_id: int, completed_on: da
     )
     await db.commit()
 
-async def clear_completed(db: aiosqlite.Connection, user_id: int) -> None:
+async def set_display_name(db: aiosqlite.Connection, user_id: int, display_name: str) -> None:
     now = datetime.utcnow().isoformat()
     await db.execute(
-        "UPDATE persons SET completed_on=NULL, updated_at=? WHERE user_id=?",
-        (now, user_id)
+        "UPDATE persons SET display_name=?, updated_at=? WHERE user_id=?",
+        (display_name.strip(), now, user_id)
     )
     await db.commit()
 
-async def get_person(db: aiosqlite.Connection, user_id: int):
-    async with db.execute("SELECT * FROM persons WHERE user_id=?", (user_id,)) as cur:
-        return await cur.fetchone()
-
 async def list_people(db: aiosqlite.Connection):
-    async with db.execute("SELECT * FROM persons ORDER BY birthday ASC") as cur:
+    async with db.execute("SELECT * FROM persons ORDER BY external_id ASC") as cur:
         rows = await cur.fetchall()
     return rows
 
 async def due_for_reminder(db: aiosqlite.Connection, ref_dt: datetime):
-    """Return users due for a reminder, respecting REMINDER_INTERVAL_DAYS and completion/window."""
+    """
+    Return verified users due for a reminder, respecting REMINDER_INTERVAL_DAYS and completion/window.
+    """
     interval = timedelta(days=SET.REMINDER_INTERVAL_DAYS)
     due = []
-    async with db.execute("SELECT * FROM persons") as cur:
+    async with db.execute("SELECT * FROM persons WHERE user_id IS NOT NULL") as cur:
         async for row in cur:
-            # must have a birthday set
-            if not row["birthday"] or row["birthday"] == "1970-01-01":
+            # need birthday from roster
+            if not row["birthday"]:
                 continue
             bday = parse_iso_date(row["birthday"])
             ref = ref_dt.date()
@@ -244,8 +245,21 @@ async def mark_reminded(db: aiosqlite.Connection, user_id: int, at: datetime) ->
 # =========================
 # Reminder helpers
 # =========================
+def display_name(row) -> str:
+    # Prefer user-set display_name, else first/last, else username/external_id
+    if row["display_name"]:
+        return row["display_name"]
+    parts = []
+    if row["first_name"]:
+        parts.append(row["first_name"])
+    if row["last_name"]:
+        parts.append(row["last_name"])
+    if parts:
+        return " ".join(parts)
+    return row["username"] or row["external_id"]
+
 def build_reminder_message(row, ref_dt: datetime) -> str:
-    name = fmt_user(row)
+    name = display_name(row)
     bday = parse_iso_date(row["birthday"])
     _, _, end = within_100_day_window(bday, ref_dt.date())
     days_left = (end - ref_dt.date()).days
@@ -291,71 +305,103 @@ async def reminder_loop_fallback(app: Application, interval_hours: int = 24):
         await asyncio.sleep(interval_hours * 3600)
 
 # =========================
-# Commands
+# Commands (User)
 # =========================
 HELP_TEXT = (
     "*IPPT Reminder Bot*\n\n"
-    "Commands:\n"
-    "• /start – register yourself with the bot\n"
-    "• /setbirthday YYYY-MM-DD – set your birthday (month/day used each year)\n"
+    "User commands:\n"
+    "• /start – get started\n"
+    "• /verify <ID> <YYYY-MM-DD> – verify yourself against the roster\n"
+    "• /setname <your preferred name> – set how I address you\n"
     "• /summary – see your status & window\n"
-    "• /complete [--date YYYY-MM-DD] – mark IPPT completed (defaults to today)\n"
-    "• /uncomplete – clear completion *only if within your 100-day window*\n"
-    "• /export – get CSV of all users (admin only)\n"
-    "• /import – upload a CSV by replying to it with /import (admin only)\n"
-    "• /admin_add <telegram_id> – add an admin (admin only)\n"
-    "• /admin_remove <telegram_id> – remove an admin (admin only)\n"
-    "• /admin_complete <user_id> [YYYY-MM-DD|--date YYYY-MM-DD] – override (admin only)\n"
-    "• /notify_now [all|<user_id> ...] [--force] – send reminders now (admin only)\n"
-    "• /help – show this help\n"
+    "• /complete [YYYY-MM-DD] – mark IPPT completed (defaults to today)\n\n"
+    "Admin commands:\n"
+    "• /export – CSV export\n"
+    "• /import – reply to a CSV file with this command\n"
+    "• /admin_complete <user_id> [YYYY-MM-DD]\n"
+    "• /notify_now [all|<user_id> ...] [--force]\n"
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.effective_chat:
-        return
-    user = update.effective_user
-    chat = update.effective_chat
-    async with open_db() as db:
-        await upsert_person(
-            db, user.id, chat.id, user.username, user.first_name, user.last_name
-        )
     await update.message.reply_text(
-        "Welcome! You’re registered.\n\n" + HELP_TEXT, parse_mode=ParseMode.MARKDOWN
+        "Welcome!\n\n"
+        "Please verify yourself with:\n"
+        "/verify <ID> <YYYY-MM-DD>\n"
+        "Example: /verify 001A 1997-05-03\n\n" + HELP_TEXT,
+        parse_mode=ParseMode.MARKDOWN
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
-
-async def setbirthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /verify <external_id> <YYYY-MM-DD>
+    Links the Telegram user to a roster record if both match.
+    """
     if not update.message:
         return
-    args = update.message.text.split()
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /setbirthday YYYY-MM-DD")
+    parts = (update.message.text or "").split()
+    if len(parts) != 3:
+        await update.message.reply_text("Usage: /verify <ID> <YYYY-MM-DD>\nExample: /verify 001A 1997-05-03")
         return
-    bday = parse_date_arg(args[1]) or parse_date_arg(update.message.text)
+
+    external_id = parts[1].strip()
+    bday = parse_date_arg(parts[2])
     if not bday:
         await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
         return
-    async with open_db() as db:
-        await set_birthday(db, update.effective_user.id, bday)
-    await update.message.reply_text(f"Birthday set to {bday.isoformat()} ✅")
 
+    async with open_db() as db:
+        row = await get_person_by_external_and_bday(db, external_id, bday)
+        if not row:
+            await update.message.reply_text("No matching record. Check your ID and birthday.")
+            return
+
+        # If the record is already linked to someone else, block it
+        if row["user_id"] and row["user_id"] != update.effective_user.id:
+            await update.message.reply_text("This ID is already verified by another Telegram account.")
+            return
+
+        await link_user_to_person(
+            db,
+            external_id=external_id,
+            user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            username=update.effective_user.username,
+            first_name=update.effective_user.first_name,
+            last_name=update.effective_user.last_name,
+        )
+
+    await update.message.reply_text("Verification successful ✅\nYou can now /setname, /summary, and /complete.")
+
+@require_verified
+async def setname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    name = update.message.text.partition(" ")[2].strip()
+    if not name:
+        await update.message.reply_text("Usage: /setname <your preferred name>")
+        return
+    if len(name) > 50:
+        await update.message.reply_text("Name too long. Keep it within 50 characters.")
+        return
+    async with open_db() as db:
+        await set_display_name(db, update.effective_user.id, name)
+    await update.message.reply_text(f"Okay! I’ll call you *{name}* ✅", parse_mode=ParseMode.MARKDOWN)
+
+@require_verified
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with open_db() as db:
-        row = await get_person(db, update.effective_user.id)
-    if not row or row["birthday"] == "1970-01-01":
-        await update.message.reply_text("Set your birthday first: /setbirthday YYYY-MM-DD")
-        return
+        row = await get_person_by_user(db, update.effective_user.id)
     bday = parse_iso_date(row["birthday"])
     ref = today_sgt()
     in_window, start_d, end_d = within_100_day_window(bday, ref)
     status = "✅ Completed" if row["completed_on"] else ("🟡 In window" if in_window else "🕒 Out of window")
+    who = display_name(row)
     completed_on = row["completed_on"] or "—"
     txt = (
         f"*Your status*\n"
-        f"Name: {update.effective_user.full_name}\n"
-        f"Birthday: {bday.strftime('%Y-%m-%d')}\n"
+        f"ID: {row['external_id']}\n"
+        f"Name: {who}\n"
+        f"Birthday (from roster): {bday.strftime('%Y-%m-%d')}\n"
         f"Window: {start_d.strftime('%Y-%m-%d')} → {end_d.strftime('%Y-%m-%d')}\n"
         f"Today: {ref.strftime('%Y-%m-%d')}\n"
         f"Completed on: {completed_on}\n"
@@ -363,28 +409,17 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
+@require_verified
 async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_date = parse_date_arg(update.message.text) or today_sgt()
+    # allow optional explicit date; default to today
+    d = parse_date_arg(update.message.text) or today_sgt()
     async with open_db() as db:
-        await set_completed(db, update.effective_user.id, target_date)
-    await update.message.reply_text(f"Marked completed on {target_date.isoformat()} ✅")
+        await set_completed(db, update.effective_user.id, d)
+    await update.message.reply_text(f"Marked completed on {d.isoformat()} ✅")
 
-async def uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with open_db() as db:
-        row = await get_person(db, update.effective_user.id)
-        if not row or row["birthday"] == "1970-01-01":
-            await update.message.reply_text("Set your birthday first: /setbirthday YYYY-MM-DD")
-            return
-        bday = parse_iso_date(row["birthday"])
-        ref = today_sgt()
-        in_window, _, _ = within_100_day_window(bday, ref)
-        if not in_window:
-            await update.message.reply_text("You can only /uncomplete while inside your 100-day window.")
-            return
-        await clear_completed(db, update.effective_user.id)
-    await update.message.reply_text("Completion cleared ✅")
-
-# ----- Admin helpers -----
+# =========================
+# Admin helpers & commands
+# =========================
 def require_admin(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else 0
@@ -395,49 +430,6 @@ def require_admin(func):
     return wrapper
 
 @require_admin
-async def admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = update.message.text.split()
-    if len(args) != 2 or not args[1].isdigit():
-        await update.message.reply_text("Usage: /admin_add <telegram_id>")
-        return
-    new_id = int(args[1])
-    if new_id in SET.ADMIN_IDS:
-        await update.message.reply_text(f"{new_id} is already an admin.")
-        return
-    SET.ADMIN_IDS.append(new_id)
-    await update.message.reply_text(f"Added admin: {new_id} ✅")
-
-@require_admin
-async def admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = update.message.text.split()
-    if len(args) != 2 or not args[1].isdigit():
-        await update.message.reply_text("Usage: /admin_remove <telegram_id>")
-        return
-    rid = int(args[1])
-    if rid not in SET.ADMIN_IDS:
-        await update.message.reply_text(f"{rid} is not an admin.")
-        return
-    SET.ADMIN_IDS = [x for x in SET.ADMIN_IDS if x != rid]
-    await update.message.reply_text(f"Removed admin: {rid} ✅")
-
-@require_admin
-async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Usage:
-      /admin_complete <user_id> [YYYY-MM-DD or --date YYYY-MM-DD]
-    """
-    text = update.message.text
-    parts = text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await update.message.reply_text("Usage: /admin_complete <user_id> [YYYY-MM-DD|--date YYYY-MM-DD]")
-        return
-    target_user = int(parts[1])
-    d = parse_date_arg(text) or today_sgt()
-    async with open_db() as db:
-        await set_completed(db, target_user, d)
-    await update.message.reply_text(f"User {target_user} marked completed on {d.isoformat()} ✅")
-
-@require_admin
 async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import csv
     from io import StringIO
@@ -445,9 +437,15 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = await list_people(db)
     buf = StringIO()
     w = csv.writer(buf)
-    w.writerow(["user_id","chat_id","username","first_name","last_name","birthday","completed_on","last_reminded_at","created_at","updated_at"])
+    w.writerow([
+        "external_id","birthday","user_id","chat_id","username","first_name","last_name",
+        "display_name","completed_on","last_reminded_at","verified_at","created_at","updated_at"
+    ])
     for r in rows:
-        w.writerow([r[k] for k in ["user_id","chat_id","username","first_name","last_name","birthday","completed_on","last_reminded_at","created_at","updated_at"]])
+        w.writerow([r[k] for k in [
+            "external_id","birthday","user_id","chat_id","username","first_name","last_name",
+            "display_name","completed_on","last_reminded_at","verified_at","created_at","updated_at"
+        ]])
     buf.seek(0)
     await update.message.reply_document(document=buf.getvalue().encode("utf-8"),
                                         filename="persons.csv",
@@ -455,6 +453,12 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_admin
 async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Expected CSV headers (minimum):
+      external_id,birthday
+    Optional:
+      display_name,user_id,chat_id,username,first_name,last_name,completed_on,last_reminded_at,verified_at
+    """
     if not update.message or not update.message.reply_to_message or not update.message.reply_to_message.document:
         await update.message.reply_text("Reply to a CSV file with /import.")
         return
@@ -465,26 +469,63 @@ async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = 0
     async with open_db() as db:
         reader = csv.DictReader(io.StringIO(raw.decode("utf-8")))
+        now = datetime.utcnow().isoformat()
         for row in reader:
-            try:
-                await upsert_person(
-                    db,
-                    int(row["user_id"]),
-                    int(row.get("chat_id") or 0),
-                    row.get("username"),
-                    row.get("first_name"),
-                    row.get("last_name"),
-                )
-                if row.get("birthday"):
-                    await set_birthday(db, int(row["user_id"]), parse_iso_date(row["birthday"]))
-                if row.get("completed_on"):
-                    await set_completed(db, int(row["user_id"]), parse_iso_date(row["completed_on"]))
-                count += 1
-            except Exception as e:
-                log.exception("Failed to import a row: %s", e)
-    await update.message.reply_text(f"Imported {count} rows ✅")
+            ext = (row.get("external_id") or "").strip()
+            bday = (row.get("birthday") or "").strip()
+            if not ext or not bday:
+                continue
+            # upsert by external_id
+            await db.execute("""
+                INSERT INTO persons (external_id, birthday, user_id, chat_id, username, first_name, last_name,
+                                     display_name, completed_on, last_reminded_at, verified_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(external_id) DO UPDATE SET
+                    birthday=excluded.birthday,
+                    user_id=COALESCE(persons.user_id, excluded.user_id),
+                    chat_id=COALESCE(persons.chat_id, excluded.chat_id),
+                    username=COALESCE(persons.username, excluded.username),
+                    first_name=COALESCE(persons.first_name, excluded.first_name),
+                    last_name=COALESCE(persons.last_name, excluded.last_name),
+                    display_name=COALESCE(persons.display_name, excluded.display_name),
+                    completed_on=COALESCE(persons.completed_on, excluded.completed_on),
+                    last_reminded_at=COALESCE(persons.last_reminded_at, excluded.last_reminded_at),
+                    verified_at=COALESCE(persons.verified_at, excluded.verified_at),
+                    updated_at=excluded.updated_at
+            """, (
+                ext, bday,
+                _safe_int(row.get("user_id")), _safe_int(row.get("chat_id")),
+                row.get("username"), row.get("first_name"), row.get("last_name"),
+                row.get("display_name"), row.get("completed_on"), row.get("last_reminded_at"),
+                row.get("verified_at"), now, now
+            ))
+            count += 1
+        await db.commit()
+    await update.message.reply_text(f"Imported/updated {count} rows ✅")
 
-# ----- /notify_now (admin-only) -----
+def _safe_int(x):
+    try:
+        return int(x) if x is not None and str(x).strip() != "" else None
+    except Exception:
+        return None
+
+@require_admin
+async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /admin_complete <user_id> [YYYY-MM-DD]
+    """
+    text = update.message.text
+    parts = text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /admin_complete <user_id> [YYYY-MM-DD]")
+        return
+    target_user = int(parts[1])
+    d = parse_date_arg(text) or today_sgt()
+    async with open_db() as db:
+        await set_completed(db, target_user, d)
+    await update.message.reply_text(f"User {target_user} marked completed on {d.isoformat()} ✅")
+
 @require_admin
 async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -494,7 +535,7 @@ async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
       /notify_now all [--force]
         - Notify everyone currently *in their 100-day window* and not completed.
-        - With --force: notify all users regardless of window/completion.
+        - With --force: notify all verified users regardless of window/completion.
 
       /notify_now <user_id> [user_id ...] [--force]
         - Notify specific users. Without --force, only if in-window & not completed.
@@ -514,12 +555,12 @@ async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Triggered reminders for {len(rows)} user(s).")
             return
 
-        # "all": send to everyone in-window & not completed (or all if --force)
+        # "all": send to verified users in-window (or all verified if --force)
         if len(ids) == 1 and ids[0].lower() == "all":
             count = 0
-            async with db.execute("SELECT * FROM persons") as cur:
+            async with db.execute("SELECT * FROM persons WHERE user_id IS NOT NULL") as cur:
                 async for r in cur:
-                    if not r["birthday"] or r["birthday"] == "1970-01-01":
+                    if not r["birthday"]:
                         continue
                     if not force:
                         bday = parse_iso_date(r["birthday"])
@@ -538,9 +579,10 @@ async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 skipped.append((sid, "not a number"))
                 continue
             uid = int(sid)
-            r = await get_person(db, uid)
+            async with db.execute("SELECT * FROM persons WHERE user_id=?", (uid,)) as cur:
+                r = await cur.fetchone()
             if not r:
-                skipped.append((sid, "not registered"))
+                skipped.append((sid, "not verified/linked"))
                 continue
             if not force:
                 bday = parse_iso_date(r["birthday"])
@@ -561,23 +603,26 @@ async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 def build_app() -> Application:
     builder = ApplicationBuilder().token(SET.BOT_TOKEN)
-    if _HAS_RL:
-        builder = builder.rate_limiter(_AIORateLimiter())  # only if installed
+    if _AIORateLimiter is not None:
+        try:
+            builder = builder.rate_limiter(_AIORateLimiter())
+        except RuntimeError as e:
+            log.warning("RateLimiter not available: %s", e)
 
     app = builder.build()
 
-    # Handlers
+    # User handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("setbirthday", setbirthday))
+    app.add_handler(CommandHandler("help", start))          # alias to show help
+    app.add_handler(CommandHandler("verify", verify))
+    app.add_handler(CommandHandler("setname", setname))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("complete", complete))
-    app.add_handler(CommandHandler("uncomplete", uncomplete))
-    app.add_handler(CommandHandler("admin_add", admin_add))
-    app.add_handler(CommandHandler("admin_remove", admin_remove))
-    app.add_handler(CommandHandler("admin_complete", admin_complete))
+
+    # Admin handlers
     app.add_handler(CommandHandler("export", export_csv))
     app.add_handler(CommandHandler("import", import_csv))
+    app.add_handler(CommandHandler("admin_complete", admin_complete))
     app.add_handler(CommandHandler("notify_now", notify_now))
 
     # Schedule reminders if JobQueue exists; else fallback loop in main()
