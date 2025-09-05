@@ -1,3 +1,6 @@
+
+
+
 import pytz
 import os
 import io
@@ -13,13 +16,13 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()}
-DB_PATH = os.getenv("DB_PATH", "ippt.db")  # set DB_PATH=/data/ippt.db on Railway
+ADMIN_IDS = set(
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+)DB_PATH = os.getenv("DB_PATH", "ippt.sqlite3")
 TZ_NAME = os.getenv("TZ", "Asia/Singapore")
-try:
-    TZINFO = ZoneInfo(TZ_NAME)
-except Exception:
-    TZINFO = ZoneInfo("UTC")
+SG_TZ = ZoneInfo(TZ_NAME)
+
+
 
 WINDOW_DAYS = 100
 REMINDER_INTERVAL_DAYS = int(os.getenv("REMINDER_INTERVAL_DAYS", "10"))
@@ -388,69 +391,66 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_import"] = False
     await update.message.reply_text(f"Imported {count} row(s).")
 
-# ---------- /report (CSV by default; Excel if xlsxwriter is available) ----------
-async def report_cmd(update, context):
-    import os, io, csv, sqlite3
-    from datetime import datetime, date, timedelta
-    from zoneinfo import ZoneInfo
-    from telegram import InputFile
+from telegram import InputFile  # make sure this import exists at top
 
-    # Gate via env ADMIN_IDS (comma-separated chat IDs)
-    ADMIN_IDS = set(
-        int(x.strip())
-        for x in os.getenv("ADMIN_IDS", "").split(",")
-        if x.strip().isdigit()
-    )
+async def report_cmd(update, context):
+    """CSV by default; Excel if xlsxwriter is installed and --xlsx flag is passed.
+    Uses global ADMIN_IDS, SG_TZ, DB_PATH and list_users() if available.
+    """
+    # Gate to admins using the global set
     if ADMIN_IDS and update.effective_chat.id not in ADMIN_IDS:
-        await update.effective_message.reply_text("🚫 Admins only. Ask to be added to ADMIN_IDS.")
+        await update.effective_message.reply_text("🚫 Admins only.")
         return
 
-    # Parse args: /report [YEAR] [--xlsx|--excel]
+    # Args: /report [YEAR] [--xlsx|--excel]
     args = context.args or []
-    year = None
-    want_xlsx = False
-    i = 0
-    if i < len(args) and args[i].isdigit():
-        year = int(args[i]); i += 1
-    if i < len(args) and args[i].lower() in ("--xlsx", "--excel"):
-        want_xlsx = True
+    year = int(args[0]) if args and args[0].isdigit() else None
+    want_xlsx = any(a.lower() in ("--xlsx", "--excel") for a in args)
 
-    tz = ZoneInfo(os.getenv("TZ", "Asia/Singapore"))
-    today = datetime.now(tz).date()
-    db_path = os.getenv("DB_PATH", "ippt.sqlite3")
+    today = datetime.now(SG_TZ).date()
 
-    # Compute season/status for a user
-    def compute_status_for(year_or_none, birthday_str, last_completed_str):
-        if not birthday_str:
-            return ("not_set", None, None, None)
-        bday = date.fromisoformat(birthday_str)
-        yy = year_or_none if year_or_none is not None else today.year
-        # season start = birthday (handle Feb 29 on non-leap years)
+    # Pull users via your helper; fallback to direct SQL
+    try:
+        users = list_users()
+    except NameError:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            users = [dict(r) for r in con.execute("SELECT * FROM users")]
+
+    # Season / state
+    def season_bounds(bday: date, yy: int):
         try:
             start = date(yy, bday.month, bday.day)
         except ValueError:
             start = date(yy, 2, 28)
         end = start + timedelta(days=100)
-        last = date.fromisoformat(last_completed_str) if last_completed_str else None
+        return start, end
 
+    def compute_state(bday_str: str | None, last_done_str: str | None):
+        if not bday_str:
+            return "not_set", None, None, None
+        bday = date.fromisoformat(bday_str)
+        yy = year or today.year
+        start, end = season_bounds(bday, yy)
+        last = date.fromisoformat(last_done_str) if last_done_str else None
         if last and last >= start:
-            return ("completed", start, end, 0)
+            return "completed", start, end, 0
         if today < start:
-            return ("pre_window", start, end, (end - today).days)
+            return "pre_window", start, end, (end - today).days
         if start <= today <= end:
-            return ("in_window", start, end, (end - today).days)
-        return ("overdue", start, end, -1)
-
-    # Pull users directly (no helper dependency)
-    with sqlite3.connect(db_path) as con:
-        con.row_factory = sqlite3.Row
-        users = [dict(r) for r in con.execute("SELECT * FROM users")]
+            return "in_window", start, end, (end - today).days
+        return "overdue", start, end, -1
 
     # Build rows
+    headers = [
+        "chat_id","username","name","birthday",
+        "season_start","season_end","last_completed",
+        "state","days_left","reminders_enabled","token"
+    ]
     rows = []
     for u in users:
         bday = u.get("birthday")
-        state, start, end, days_left = compute_status_for(year, bday, u.get("last_completed"))
+        state, start, end, days_left = compute_state(bday, u.get("last_completed"))
         rows.append([
             u.get("chat_id"),
             u.get("username") or "",
@@ -465,12 +465,11 @@ async def report_cmd(update, context):
             u.get("token") or "",
         ])
 
-    headers = ["chat_id","username","name","birthday","season_start","season_end","last_completed","state","days_left","reminders_enabled","token"]
-
-    # Excel (optional)
+    # Excel path (optional)
     if want_xlsx:
         try:
             import xlsxwriter
+            import io
             output = io.BytesIO()
             wb = xlsxwriter.Workbook(output, {"in_memory": True})
             ws = wb.add_worksheet("IPPT Report")
@@ -496,7 +495,8 @@ async def report_cmd(update, context):
         except Exception as e:
             await update.effective_message.reply_text(f"⚠️ Excel export unavailable ({e}). Falling back to CSV…")
 
-    # CSV (default)
+    # CSV path (default)
+    import io, csv
     sio = io.StringIO()
     w = csv.writer(sio)
     w.writerow(headers)
