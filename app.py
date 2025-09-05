@@ -436,6 +436,103 @@ async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.exception("Failed to import a row: %s", e)
     await update.message.reply_text(f"Imported {count} rows ✅")
 
+@require_admin
+async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /notify_now
+        - Run the normal "due" reminder check immediately (respects REMINDER_INTERVAL_DAYS).
+
+      /notify_now all [--force]
+        - Notify everyone currently *in their 100-day window* and not completed.
+        - With --force: notify all users regardless of window/completion.
+
+      /notify_now <user_id> [user_id ...] [--force]
+        - Notify specific users. Without --force, only if in-window & not completed.
+    """
+    now = datetime.utcnow()
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    force = parts[-1] == "--force"
+    ids = [p for p in parts[1:] if p != "--force"]
+
+    async with open_db() as db:
+        # Case 1: no IDs → run normal due logic now (respects interval)
+        if not ids:
+            rows = await due_for_reminder(db, now)
+            for r in rows:
+                await send_single_reminder(context, db, r, now, mark=True)
+            await update.message.reply_text(f"Triggered reminders for {len(rows)} user(s).")
+            return
+
+        # Case 2: "all" → send to everyone in window & not completed (or force)
+        if len(ids) == 1 and ids[0].lower() == "all":
+            count = 0
+            async with db.execute("SELECT * FROM persons") as cur:
+                async for r in cur:
+                    if not force:
+                        bday = parse_iso_date(r["birthday"])
+                        in_window, _, _ = within_100_day_window(bday, now.date())
+                        if not in_window or r["completed_on"]:
+                            continue
+                    await send_single_reminder(context, db, r, now, mark=not force)
+                    count += 1
+            await update.message.reply_text(f"Sent reminders to {count} user(s){' (forced)' if force else ''}.")
+            return
+
+        # Case 3: specific IDs
+        ok, skipped = 0, []
+        for sid in ids:
+            if not sid.isdigit():
+                skipped.append((sid, "not a number"))
+                continue
+            uid = int(sid)
+            r = await get_person(db, uid)
+            if not r:
+                skipped.append((sid, "not registered"))
+                continue
+            if not force:
+                bday = parse_iso_date(r["birthday"])
+                in_window, _, _ = within_100_day_window(bday, now.date())
+                if not in_window or r["completed_on"]:
+                    skipped.append((sid, "not in window or already completed"))
+                    continue
+            await send_single_reminder(context, db, r, now, mark=not force)
+            ok += 1
+
+        msg = f"Sent to {ok} user(s){' (forced)' if force else ''}."
+        if skipped:
+            msg += "\nSkipped: " + ", ".join([f"{sid} ({why})" for sid, why in skipped])
+        await update.message.reply_text(msg)
+
+
+
+
+
+
+from datetime import datetime
+
+def build_reminder_message(row, ref_dt: datetime) -> str:
+    name = fmt_user(row)
+    bday = parse_iso_date(row["birthday"])
+    _, start, end = within_100_day_window(bday, ref_dt.date())
+    days_left = (end - ref_dt.date()).days
+    return (
+        f"👋 Hi {name}! Your 100-day IPPT window ends on {end.strftime('%Y-%m-%d')}.\n"
+        f"Days left: {days_left}.\n\n"
+        f"Reply /complete to mark done, or /summary to see details."
+    )
+
+async def send_single_reminder(context: ContextTypes.DEFAULT_TYPE, db: aiosqlite.Connection, row, ref_dt: datetime, mark=True):
+    msg = build_reminder_message(row, ref_dt)
+    try:
+        await context.bot.send_message(chat_id=row["chat_id"], text=msg)
+        if mark:
+            await mark_reminded(db, row["user_id"], ref_dt)
+    except Exception as e:
+        log.warning("Send failed to %s: %s", row["chat_id"], e)
+
+
 # ----------------------------
 # Reminders (job queue)
 # ----------------------------
