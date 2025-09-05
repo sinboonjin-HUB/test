@@ -69,6 +69,7 @@ def init_db():
         con.commit()
 
 # -------------------- DB Helpers --------------------
+# -------------------- DB Helpers --------------------
 def get_user(chat_id: int) -> dict | None:
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
@@ -81,21 +82,31 @@ def list_users() -> list[dict]:
         con.row_factory = sqlite3.Row
         return [dict(r) for r in con.execute("SELECT * FROM users")]
 
-def set_birthday(chat_id: int, bday: str): date.fromisoformat(bday); 
-with sqlite3.connect(DB_PATH) as con: con.execute("UPDATE users SET birthday=? WHERE chat_id=?", (bday, chat_id)); con.commit()
+def set_birthday(chat_id: int, bday: str):
+    # Validate format; raises ValueError if invalid
+    date.fromisoformat(bday)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE users SET birthday=? WHERE chat_id=?", (bday, chat_id))
+        con.commit()
 
 def set_name(chat_id: int, name: str):
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("UPDATE users SET name=? WHERE chat_id=?", (name, chat_id)); con.commit()
+        con.execute("UPDATE users SET name=? WHERE chat_id=?", (name, chat_id))
+        con.commit()
 
 def set_completed(chat_id: int, done: str | None):
-    if done: date.fromisoformat(done)
+    if done:
+        # Validate format
+        date.fromisoformat(done)
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("UPDATE users SET last_completed=? WHERE chat_id=?", (done, chat_id)); con.commit()
+        con.execute("UPDATE users SET last_completed=? WHERE chat_id=?", (done, chat_id))
+        con.commit()
 
 def mark_reminded_today(chat_id: int, today: date):
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("UPDATE users SET last_reminded_on=? WHERE chat_id=?", (today.isoformat(), chat_id)); con.commit()
+        con.execute("UPDATE users SET last_reminded_on=? WHERE chat_id=?", (today.isoformat(), chat_id))
+        con.commit()
+
 
 # -------------------- IPPT Logic --------------------
 def season_start(birthday: date, year: int) -> date:
