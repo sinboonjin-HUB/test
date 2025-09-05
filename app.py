@@ -1434,6 +1434,18 @@ async def remind_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await daily_reminder_job(context)
     await update.message.reply_text("✅ Reminders triggered now.")
 
+# add an error handler (so you see clean messages)
+async def on_error(update, context):
+    logging.exception("Unhandled exception", exc_info=context.error)
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text("⚠️ Something went wrong while handling that command.")
+        except Exception:
+            pass
+
+app.add_error_handler(on_error)
+
+
 # ---------- Wiring ----------
 def setup_handlers(app):
     # User
