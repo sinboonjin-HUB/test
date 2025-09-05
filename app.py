@@ -1,7 +1,3 @@
-
-
-import logging
-import pytz
 import os
 import io
 import re
@@ -12,28 +8,17 @@ from datetime import date, datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
 from telegram import Update, InputFile
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | ippt-bot | %(message)s",
-)
-log = logging.getLogger("ippt-bot")
-
-
-
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = set(
-    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
-)
-DB_PATH = os.getenv("DB_PATH", "ippt.sqlite3")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()}
+DB_PATH = os.getenv("DB_PATH", "ippt.db")  # set DB_PATH=/data/ippt.db on Railway
 TZ_NAME = os.getenv("TZ", "Asia/Singapore")
-SG_TZ = ZoneInfo(TZ_NAME)
-TZINFO = SG_TZ  # alias for legacy references
-
+try:
+    TZINFO = ZoneInfo(TZ_NAME)
+except Exception:
+    TZINFO = ZoneInfo("UTC")
 
 WINDOW_DAYS = 100
 REMINDER_INTERVAL_DAYS = int(os.getenv("REMINDER_INTERVAL_DAYS", "10"))
@@ -402,237 +387,63 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_import"] = False
     await update.message.reply_text(f"Imported {count} row(s).")
 
-from telegram import InputFile  # make sure this import exists at top
-
-async def report_cmd(update, context):
-    """CSV by default; Excel if xlsxwriter is installed and --xlsx flag is passed.
-    Uses global ADMIN_IDS, SG_TZ, DB_PATH and list_users() if available.
-    """
-    # Gate to admins using the global set
-    if ADMIN_IDS and update.effective_chat.id not in ADMIN_IDS:
-        await update.effective_message.reply_text("🚫 Admins only.")
-        return
-
-    # Args: /report [YEAR] [--xlsx|--excel]
-    args = context.args or []
-    year = int(args[0]) if args and args[0].isdigit() else None
-    want_xlsx = any(a.lower() in ("--xlsx", "--excel") for a in args)
-
-    today = datetime.now(SG_TZ).date()
-
-    # Pull users via your helper; fallback to direct SQL
-    try:
-        users = list_users()
-    except NameError:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            users = [dict(r) for r in con.execute("SELECT * FROM users")]
-
-    # Season / state
-    def season_bounds(bday: date, yy: int):
-        try:
-            start = date(yy, bday.month, bday.day)
-        except ValueError:
-            start = date(yy, 2, 28)
-        end = start + timedelta(days=100)
-        return start, end
-
-    def compute_state(bday_str: str | None, last_done_str: str | None):
-        if not bday_str:
-            return "not_set", None, None, None
-        bday = date.fromisoformat(bday_str)
-        yy = year or today.year
-        start, end = season_bounds(bday, yy)
-        last = date.fromisoformat(last_done_str) if last_done_str else None
-        if last and last >= start:
-            return "completed", start, end, 0
-        if today < start:
-            return "pre_window", start, end, (end - today).days
-        if start <= today <= end:
-            return "in_window", start, end, (end - today).days
-        return "overdue", start, end, -1
-
-    # Build rows
-    headers = [
-        "chat_id","username","name","birthday",
-        "season_start","season_end","last_completed",
-        "state","days_left","reminders_enabled","token"
-    ]
-    rows = []
-    for u in users:
-        bday = u.get("birthday")
-        state, start, end, days_left = compute_state(bday, u.get("last_completed"))
-        rows.append([
-            u.get("chat_id"),
-            u.get("username") or "",
-            u.get("name") or "",
-            bday or "",
-            start.isoformat() if start else "",
-            end.isoformat() if end else "",
-            u.get("last_completed") or "",
-            state,
-            days_left if days_left is not None else "",
-            u.get("reminders_enabled", 1),
-            u.get("token") or "",
-        ])
-
-    # Excel path (optional)
-    if want_xlsx:
-        try:
-            import xlsxwriter
-            import io
-            output = io.BytesIO()
-            wb = xlsxwriter.Workbook(output, {"in_memory": True})
-            ws = wb.add_worksheet("IPPT Report")
-
-            for c, h in enumerate(headers): ws.write(0, c, h)
-            for r, row in enumerate(rows, start=1):
-                for c, val in enumerate(row): ws.write(r, c, val)
-
-            yellow = wb.add_format({"bg_color": "#FFF2CC"})
-            red    = wb.add_format({"bg_color": "#F8CBAD"})
-            # days_left <= 100 (col 8)
-            ws.conditional_format(1, 8, len(rows), 8, {"type":"cell","criteria":"<=","value":100,"format":yellow})
-            # state contains "overdue" (col 7)
-            ws.conditional_format(1, 7, len(rows), 7, {"type":"text","criteria":"containing","value":"overdue","format":red})
-
-            wb.close()
-            output.seek(0)
-            await update.effective_message.reply_document(
-                InputFile(output, filename=f"ippt_report_{year or today.year}.xlsx"),
-                caption="📊 Excel report"
-            )
-            return
-        except Exception as e:
-            await update.effective_message.reply_text(f"⚠️ Excel export unavailable ({e}). Falling back to CSV…")
-
-    # CSV path (default)
-    import io, csv
-    sio = io.StringIO()
-    w = csv.writer(sio)
-    w.writerow(headers)
-    w.writerows(rows)
-    bio = io.BytesIO(sio.getvalue().encode("utf-8")); bio.seek(0)
-    await update.effective_message.reply_document(
-        InputFile(bio, filename=f"ippt_report_{year or today.year}.csv"),
-        caption="📄 CSV report"
-    )
-
 # ---------- Status ----------
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
+    msg = update.message
     today = current_local_date()
     tid = msg.from_user.id
 
-    # Safe ISO parser for DB datetimes (handles 'Z' and offsets)
-    def _date_from_db(dt_str: str | None):
-        if not dt_str:
-            return None
-        s = dt_str.strip()
-        # Accept 'Z' as UTC
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        try:
-            dt = datetime.fromisoformat(s)
-        except Exception:
-            # As a last resort, take only date part
-            try:
-                return date.fromisoformat(s[:10])
-            except Exception:
-                return None
-        # Normalize to local date if tz-aware
-        if dt.tzinfo is not None:
-            local_dt = dt.astimezone(ZoneInfo(os.getenv("TZ", "Asia/Singapore")))
-            return local_dt.date()
-        return dt.date()
-
-    # --- Fetch user & personnel
     with closing(db_connect()) as conn:
         data = get_personnel_and_user(conn, tid)
     if not data:
         return await msg.reply_text("Please /verify first.")
 
-    # Keep your tuple unpacking order
     _, personnel_id, _, completed_year, _, birthday_str, group_name, full_name = data
+    bday = parse_date_strict(birthday_str)
 
-    # Validate birthday
-    try:
-        bday = parse_date_strict(birthday_str)
-    except Exception:
-        return await msg.reply_text("⚠️ Your birthday is not set correctly. Please /setbirthday again.")
-
-    # Window & season info
     in_window, start, end = today_in_window(bday, today)
     window_key = start.year
     next_start = adjusted_birthday_for_year(bday, start.year + 1)
 
-    # Deferment (optional)
     with closing(db_connect()) as conn:
         d = get_deferment_by_pid(conn, personnel_id, window_key)
     defer_reason, defer_status = (d[0], d[1]) if d else (None, None)
 
-    # Define cycle bounds for queries
     cycle_start = start
     cycle_end_excl = adjusted_birthday_for_year(bday, start.year + 1)
-    window_end = end  # inclusive window end by your helper semantics
+    window_end = end
 
-    # Most recent completion within window (inclusive)
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT completed_at
-            FROM completions
-            WHERE telegram_id = ?
-              AND completed_at >= ?
-              AND completed_at <= ?
-            ORDER BY completed_at DESC
-            LIMIT 1
-            """,
+            "SELECT completed_at FROM completions WHERE telegram_id=? AND completed_at >= ? AND completed_at <= ? ORDER BY completed_at DESC LIMIT 1",
             (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(window_end, 23, 59)),
         )
         row_win = cur.fetchone()
-    completed_in_window_date = _date_from_db(row_win[0]) if row_win else None
+    completed_in_window_date = datetime.fromisoformat(row_win[0]).date() if row_win else None
 
-    # If none in window, check within whole cycle (exclusive upper bound)
     completed_in_cycle_date = None
     if not completed_in_window_date:
         with closing(db_connect()) as conn:
             cur = conn.cursor()
             cur.execute(
-                """
-                SELECT completed_at
-                FROM completions
-                WHERE telegram_id = ?
-                  AND completed_at >= ?
-                  AND completed_at <  ?
-                ORDER BY completed_at DESC
-                LIMIT 1
-                """,
-                (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(cycle_end_excl, 0, 0)),
+                "SELECT completed_at FROM completions WHERE telegram_id=? AND completed_at >= ? AND completed_at < ? ORDER BY completed_at DESC LIMIT 1",
+                (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(cycle_end_excl - timedelta(days=1), 23, 59)),
             )
             row_cyc = cur.fetchone()
-        completed_in_cycle_date = _date_from_db(row_cyc[0]) if row_cyc else None
+        completed_in_cycle_date = datetime.fromisoformat(row_cyc[0]).date() if row_cyc else None
 
-    # Window result line
     if completed_in_window_date:
         window_result_line = f"100-day window result: ✅ Completed on time ({completed_in_window_date:%Y-%m-%d})"
     elif completed_in_cycle_date:
-        overdue_days = max(0, (completed_in_cycle_date - window_end).days)
+        overdue_days = (completed_in_cycle_date - window_end).days
         window_result_line = f"100-day window result: ⚠️ Completed overdue by {overdue_days} day(s) ({completed_in_cycle_date:%Y-%m-%d})"
     else:
         window_result_line = "100-day window result: ❌ Not completed"
 
-    # IPPT status line (consider deferment & last recorded season completion)
-    # Normalise completed_year to int if present
-    try:
-        completed_year_norm = int(completed_year) if completed_year is not None else None
-    except Exception:
-        completed_year_norm = None
-
     if defer_status == "approved":
-        status_line = f"IPPT Status: Defer — {defer_reason or 'Approved'}"
-    elif in_window and completed_year_norm == window_key:
+        status_line = f"IPPT Status: Defer — {defer_reason}"
+    elif in_window and completed_year == window_key:
         status_line = "IPPT Status: ✅ Completed"
     else:
         if today < start:
@@ -643,38 +454,24 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             status_line = f"IPPT Status: Window closed — next window starts {format_date(next_start)}"
 
-    # Cycle status (for the current cycle containing 'today')
     cycle_today_start, cycle_today_end_excl = cycle_for_date(bday, today)
     cycle_window_end_today = cycle_today_start + timedelta(days=WINDOW_DAYS)
-
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT completed_at
-            FROM completions
-            WHERE telegram_id = ?
-              AND completed_at >= ?
-              AND completed_at <  ?
-            ORDER BY completed_at DESC
-            LIMIT 1
-            """,
-            (tid, iso_from_local_date(cycle_today_start, 0, 0), iso_from_local_date(cycle_today_end_excl, 0, 0)),
+            "SELECT completed_at FROM completions WHERE telegram_id=? AND completed_at >= ? AND completed_at < ? ORDER BY completed_at DESC LIMIT 1",
+            (tid, iso_from_local_date(cycle_today_start, 0, 0), iso_from_local_date(cycle_today_end_excl - timedelta(days=1), 23, 59)),
         )
         r = cur.fetchone()
-
     if r:
-        cd = _date_from_db(r[0])
-        if cd and cd <= cycle_window_end_today:
+        cd = datetime.fromisoformat(r[0]).date()
+        if cd <= cycle_window_end_today:
             cycle_line = "Cycle status: ✅ Completed (on time)"
-        elif cd:
-            cycle_line = f"Cycle status: ✅ Completed (overdue by {(cd - cycle_window_end_today).days} day(s))"
         else:
-            cycle_line = "Cycle status: Not completed"
+            cycle_line = f"Cycle status: ✅ Completed (overdue by {(cd - cycle_window_end_today).days} day(s))"
     else:
         cycle_line = "Cycle status: Not completed"
 
-    # Compose output
     lines = [
         status_line,
         f"Window: {format_date(start)} → {format_date(end)}",
@@ -688,7 +485,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Name:   {full_name}")
     lines.append(f"ID:     {personnel_id}")
     await msg.reply_text("\n".join(lines))
-
 
 # ---------- User complete/uncomplete ----------
 async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1445,32 +1241,6 @@ async def remind_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await daily_reminder_job(context)
     await update.message.reply_text("✅ Reminders triggered now.")
 
-# 1) define the error handler (top-level is fine)
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.exception("Unhandled exception", exc_info=context.error)
-    # try to notify the user without crashing if update/message missing
-    try:
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("⚠️ Something went wrong while handling that command.")
-    except Exception:
-        pass
-
-# 2) register it INSIDE build_app(), not at module scope
-def build_app() -> Application:
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # ... your other handler registrations ...
-    app.add_handler(CommandHandler("status", status))     # example
-    app.add_handler(CommandHandler("report", report_cmd)) # example
-
-    # register the error handler here
-    app.add_error_handler(on_error)
-
-    # schedule jobs etc.
-    schedule_daily_job(app)
-    return app
-
-
 # ---------- Wiring ----------
 def setup_handlers(app):
     # User
@@ -1487,7 +1257,7 @@ def setup_handlers(app):
     app.add_handler(CommandHandler("add_personnel", add_personnel))
     app.add_handler(CommandHandler("update_birthday", update_birthday))
     app.add_handler(CommandHandler("import_csv", import_csv_cmd))
-    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("report", report))
     app.add_handler(CommandHandler("defer_reason", defer_reason))
     app.add_handler(CommandHandler("defer_reset", defer_reset))
     app.add_handler(CommandHandler("admin_complete", admin_complete))
@@ -1503,24 +1273,10 @@ def setup_handlers(app):
     app.add_handler(MessageHandler(filters.Document.ALL & (~filters.COMMAND), document_handler))
 
 def schedule_jobs(app):
-    try:
-        app.job_queue.run_daily(
-            daily_reminder_job,
-            time=time(hour=9, minute=0, tzinfo=TZINFO),
-            name="daily_reminders",
-        )
-        log.info("JobQueue scheduled: daily reminders at 09:00 %s", TZ_NAME)
-    except TypeError:
-        now = datetime.now(SG_TZ)
-        first_run = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        if first_run <= now:
-            first_run += timedelta(days=1)
-        delay = (first_run - now).total_seconds()
-        app.job_queue.run_repeating(
-            daily_reminder_job, interval=86400, first=delay, name="daily_reminders"
-        )
-        log.info("JobQueue scheduled via repeating: next run in %.0fs (%s)", delay, TZ_NAME)
-
+    if os.getenv("TEST_REMINDERS") == "1":
+        app.job_queue.run_repeating(daily_reminder_job, interval=60, first=1, name="test_reminders")
+    else:
+        app.job_queue.run_daily(daily_reminder_job, time=time(hour=9, minute=0, tzinfo=TZINFO), name="daily_reminders")
 
 def main():
     init_db()
