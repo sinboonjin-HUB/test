@@ -40,47 +40,138 @@ ENV_ADMIN_IDS = set(
 
 # -------------------- DB Helpers --------------------
 def init_db():
+    """
+    Initialize or migrate the SQLite schema to the expected one.
+
+    Target schema:
+      users(
+        chat_id INTEGER PRIMARY KEY,
+        username TEXT,
+        name TEXT,
+        birthday TEXT,
+        last_completed TEXT,
+        reminders_enabled INTEGER DEFAULT 1,
+        last_reminded_on TEXT,
+        token TEXT UNIQUE,
+        is_admin INTEGER DEFAULT 0
+      )
+    """
+    def table_exists(con, name: str) -> bool:
+        cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (name,))
+        return cur.fetchone() is not None
+
+    def get_cols(con, name: str) -> set[str]:
+        cur = con.execute(f"PRAGMA table_info({name});")
+        return {row[1] for row in cur.fetchall()}  # row[1] = column name
+
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER PRIMARY KEY,
-            username TEXT,
-            name TEXT,              -- free-text user display name
-            birthday TEXT,          -- YYYY-MM-DD
-            last_completed TEXT,    -- YYYY-MM-DD (last IPPT completion date)
-            reminders_enabled INTEGER DEFAULT 1,
-            last_reminded_on TEXT,  -- YYYY-MM-DD (SG local date)
-            token TEXT UNIQUE,      -- admin token to act on user
-            is_admin INTEGER DEFAULT 0
-        );
-        """)
-        # backfill token/is_admin/name for existing rows
-        cur = con.execute("SELECT chat_id, token FROM users")
-        rows = cur.fetchall()
-        for chat_id, tok in rows:
-            if not tok:
-                con.execute("UPDATE users SET token=? WHERE chat_id=?", (generate_token(), chat_id))
-        # elevate env admins
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = OFF;")  # not strictly needed here
+        con.execute("PRAGMA journal_mode = WAL;")
+
+        need_create = not table_exists(con, "users")
+        if need_create:
+            # Fresh create
+            con.execute("""
+            CREATE TABLE users (
+                chat_id INTEGER PRIMARY KEY,
+                username TEXT,
+                name TEXT,
+                birthday TEXT,
+                last_completed TEXT,
+                reminders_enabled INTEGER DEFAULT 1,
+                last_reminded_on TEXT,
+                token TEXT UNIQUE,
+                is_admin INTEGER DEFAULT 0
+            );
+            """)
+            con.commit()
+        else:
+            # Migrate if needed
+            cols = get_cols(con, "users")
+
+            # If the table is missing the PRIMARY KEY column (chat_id), rebuild table
+            if "chat_id" not in cols:
+                # Build a brand-new table with correct schema
+                con.execute("""
+                CREATE TABLE IF NOT EXISTS users_new (
+                    chat_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    name TEXT,
+                    birthday TEXT,
+                    last_completed TEXT,
+                    reminders_enabled INTEGER DEFAULT 1,
+                    last_reminded_on TEXT,
+                    token TEXT UNIQUE,
+                    is_admin INTEGER DEFAULT 0
+                );
+                """)
+
+                # Pull all rows from old table and map column names best-effort
+                rows = list(con.execute("SELECT * FROM users"))
+                for r in rows:
+                    r = dict(r)
+                    chat_id = (
+                        r.get("chat_id") or
+                        r.get("id") or
+                        r.get("telegram_id") or
+                        r.get("user_id")
+                    )
+                    username = r.get("username") or r.get("user_name")
+                    name = r.get("name")
+                    birthday = r.get("birthday") or r.get("dob")
+                    last_completed = r.get("last_completed") or r.get("completed_date")
+                    reminders_enabled = r.get("reminders_enabled", 1)
+                    last_reminded_on = r.get("last_reminded_on")
+                    token = r.get("token") or generate_token()
+                    is_admin = r.get("is_admin", 0)
+
+                    con.execute("""
+                        INSERT OR IGNORE INTO users_new
+                        (chat_id, username, name, birthday, last_completed, reminders_enabled, last_reminded_on, token, is_admin)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """, (
+                        chat_id, username, name, birthday, last_completed,
+                        reminders_enabled, last_reminded_on, token, is_admin
+                    ))
+
+                # Swap tables
+                con.execute("DROP TABLE users;")
+                con.execute("ALTER TABLE users_new RENAME TO users;")
+                con.commit()
+                cols = get_cols(con, "users")  # refresh
+
+            # For any *non-PK* missing columns, add them
+            # (SQLite can ALTER TABLE ... ADD COLUMN, but not change PK)
+            addable_cols = {
+                "username": "TEXT",
+                "name": "TEXT",
+                "birthday": "TEXT",
+                "last_completed": "TEXT",
+                "reminders_enabled": "INTEGER DEFAULT 1",
+                "last_reminded_on": "TEXT",
+                "token": "TEXT UNIQUE",
+                "is_admin": "INTEGER DEFAULT 0",
+            }
+            for col, decl in addable_cols.items():
+                if col not in cols:
+                    con.execute(f"ALTER TABLE users ADD COLUMN {col} {decl};")
+            con.commit()
+
+        # --- Post-migration backfills ---
+        # Ensure every row has a token
+        cur = con.execute("SELECT chat_id, token FROM users;")
+        to_fill = [(generate_token(), row["chat_id"]) for row in cur.fetchall() if not row["token"]]
+        if to_fill:
+            con.executemany("UPDATE users SET token=? WHERE chat_id=?;", to_fill)
+
+        # Ensure reminders_enabled default to 1 when NULL
+        con.execute("UPDATE users SET reminders_enabled=1 WHERE reminders_enabled IS NULL;")
+
+        # Seed admins from env var, if present
         if ENV_ADMIN_IDS:
-            con.executemany("UPDATE users SET is_admin=1 WHERE chat_id=?", [(i,) for i in ENV_ADMIN_IDS])
-        con.commit()
+            con.executemany("UPDATE users SET is_admin=1 WHERE chat_id=?;", [(i,) for i in ENV_ADMIN_IDS])
 
-def generate_token(n: int = TOKEN_LEN) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(n))
-
-def upsert_user(chat_id: int, username: str | None):
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-        INSERT INTO users (chat_id, username, token)
-        VALUES (?, ?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET username=excluded.username;
-        """, (chat_id, username, generate_token()))
-        # Ensure token exists even on update
-        con.execute("""
-        UPDATE users SET token=COALESCE(token, ?)
-        WHERE chat_id=?;
-        """, (generate_token(), chat_id))
         con.commit()
 
 def set_birthday(chat_id: int, birthday_str: str):
