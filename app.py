@@ -6,28 +6,37 @@ from datetime import datetime, date, timedelta
 from typing import List, Optional, Tuple
 
 import aiosqlite
-from dateutil.relativedelta import relativedelta
 from dateutil.parser import isoparse
-from pydantic import BaseModel, Field, ValidationError
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from pydantic import BaseModel, Field
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes,
-    MessageHandler, filters, CallbackQueryHandler, AIORateLimiter,
+    MessageHandler, filters, CallbackQueryHandler,
 )
 
-# ----------------------------
+# =========================
+# Optional Extras (guards)
+# =========================
+# Optional rate limiter (python-telegram-bot[rate-limiter])
+try:
+    from telegram.ext import AIORateLimiter as _AIORateLimiter
+    _HAS_RL = True
+except Exception:
+    _HAS_RL = False
+
+# =========================
 # Logging
-# ----------------------------
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("ippt-bot")
 
-# ----------------------------
+# =========================
 # Settings (env-driven)
-# ----------------------------
+# =========================
 class Settings(BaseModel):
     BOT_TOKEN: str
     ADMIN_IDS: List[int] = Field(default_factory=list)
@@ -38,7 +47,7 @@ class Settings(BaseModel):
     @classmethod
     def from_env(cls) -> "Settings":
         raw_admins = os.getenv("ADMIN_IDS", "")
-        admin_ids = []
+        admin_ids: List[int] = []
         for tok in [t.strip() for t in raw_admins.split(",") if t.strip()]:
             try:
                 admin_ids.append(int(tok))
@@ -55,9 +64,9 @@ class Settings(BaseModel):
 
 SET = Settings.from_env()
 
-# ----------------------------
-# DB helpers (SQLite via aiosqlite)
-# ----------------------------
+# =========================
+# DB (SQLite via aiosqlite)
+# =========================
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS persons (
     user_id INTEGER PRIMARY KEY,
@@ -65,22 +74,21 @@ CREATE TABLE IF NOT EXISTS persons (
     username TEXT,
     first_name TEXT,
     last_name TEXT,
-    birthday TEXT NOT NULL,         -- stored as ISO date (YYYY-MM-DD) for the current year reference
+    birthday TEXT NOT NULL,         -- ISO date (YYYY-MM-DD) for month/day reference
     completed_on TEXT,              -- ISO date when IPPT completed (year-specific)
-    last_reminded_at TEXT,          -- ISO datetime ISO format
+    last_reminded_at TEXT,          -- ISO datetime
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 """
 
-# lightweight migrations: add missing columns if an older DB exists
+# lightweight migrations
 MIGRATIONS = [
     ("ALTER TABLE persons ADD COLUMN last_reminded_at TEXT", "last_reminded_at"),
 ]
 
 async def ensure_schema(db: aiosqlite.Connection) -> None:
     await db.executescript(SCHEMA)
-    # discover columns
     cols = set()
     async with db.execute("PRAGMA table_info(persons)") as cur:
         async for row in cur:
@@ -94,27 +102,24 @@ async def ensure_schema(db: aiosqlite.Connection) -> None:
 async def open_db() -> aiosqlite.Connection:
     os.makedirs(os.path.dirname(SET.DB_PATH), exist_ok=True)
     db = await aiosqlite.connect(SET.DB_PATH)
-    await ensure_schema(db)
     db.row_factory = aiosqlite.Row
+    await ensure_schema(db)
     return db
 
-# ----------------------------
+# =========================
 # Utilities
-# ----------------------------
+# =========================
 DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 
 def today_sgt() -> date:
-    # SG has no DST; we can safely use local date from UTC offset by +8 if needed.
-    # For simplicity, compute from current UTC and add 8h.
-    # However, Python's date.today() on the container is typically UTC. We'll just use UTC+8 proxy:
+    # Approximated as UTC+8 (SG has no DST)
     return (datetime.utcnow() + timedelta(hours=8)).date()
 
 def within_100_day_window(bday: date, ref: date) -> Tuple[bool, date, date]:
     """
-    The "window" is 100 days after the *current-year* birthday date.
-    We assume stored birthday is the YYYY-MM-DD of the user's actual birthdate (month, day are used).
+    100-day window after the current-year birthday date.
+    Stored birthday uses true Y-M-D, but window keys off month/day each year.
     """
-    # align bday to current year
     bday_this_year = bday.replace(year=ref.year)
     start = bday_this_year
     end = bday_this_year + timedelta(days=100)
@@ -123,14 +128,26 @@ def within_100_day_window(bday: date, ref: date) -> Tuple[bool, date, date]:
 def parse_iso_date(s: str) -> date:
     return isoparse(s).date()
 
+def parse_date_arg(text: str) -> Optional[date]:
+    m = DATE_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
 def fmt_user(row) -> str:
     name = (row["first_name"] or "") + (" " + row["last_name"] if row["last_name"] else "")
     name = name.strip() or (row["username"] or f"u{row['user_id']}")
     return name
 
-# ----------------------------
-# Core operations
-# ----------------------------
+def is_admin(uid: int) -> bool:
+    return uid in SET.ADMIN_IDS
+
+# =========================
+# Core DB Ops
+# =========================
 async def upsert_person(
     db: aiosqlite.Connection,
     user_id: int,
@@ -192,60 +209,104 @@ async def list_people(db: aiosqlite.Connection):
         rows = await cur.fetchall()
     return rows
 
-async def due_for_reminder(db: aiosqlite.Connection, ref_dt: datetime) -> List[aiosqlite.Row]:
-    # Idempotent: only remind if last_reminded_at is older than interval.
+async def due_for_reminder(db: aiosqlite.Connection, ref_dt: datetime):
+    """Return users due for a reminder, respecting REMINDER_INTERVAL_DAYS and completion/window."""
     interval = timedelta(days=SET.REMINDER_INTERVAL_DAYS)
-    rows = []
+    due = []
     async with db.execute("SELECT * FROM persons") as cur:
         async for row in cur:
+            # must have a birthday set
+            if not row["birthday"] or row["birthday"] == "1970-01-01":
+                continue
             bday = parse_iso_date(row["birthday"])
             ref = ref_dt.date()
-            in_window, start, end = within_100_day_window(bday, ref)
+            in_window, _, _ = within_100_day_window(bday, ref)
             if not in_window:
                 continue
             if row["completed_on"]:
                 continue
             last_s = row["last_reminded_at"]
             if last_s:
-                last = isoparse(last_s)
-                if ref_dt - last < interval:
-                    continue
-            rows.append(row)
-    return rows
+                try:
+                    last = isoparse(last_s)
+                    if ref_dt - last < interval:
+                        continue
+                except Exception:
+                    pass
+            due.append(row)
+    return due
 
 async def mark_reminded(db: aiosqlite.Connection, user_id: int, at: datetime) -> None:
     await db.execute("UPDATE persons SET last_reminded_at=?, updated_at=? WHERE user_id=?",
                      (at.isoformat(), at.isoformat(), user_id))
     await db.commit()
 
-def parse_date_arg(text: str) -> Optional[date]:
-    m = DATE_RE.search(text)
-    if not m:
-        return None
+# =========================
+# Reminder helpers
+# =========================
+def build_reminder_message(row, ref_dt: datetime) -> str:
+    name = fmt_user(row)
+    bday = parse_iso_date(row["birthday"])
+    _, _, end = within_100_day_window(bday, ref_dt.date())
+    days_left = (end - ref_dt.date()).days
+    return (
+        f"👋 Hi {name}! Your 100-day IPPT window ends on {end.strftime('%Y-%m-%d')}.\n"
+        f"Days left: {days_left}.\n\n"
+        f"Reply /complete to mark done, or /summary to see details."
+    )
+
+async def send_single_reminder(context: ContextTypes.DEFAULT_TYPE, db: aiosqlite.Connection, row, ref_dt: datetime, mark=True):
+    msg = build_reminder_message(row, ref_dt)
     try:
-        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    except ValueError:
-        return None
+        await context.bot.send_message(chat_id=row["chat_id"], text=msg)
+        if mark:
+            await mark_reminded(db, row["user_id"], ref_dt)
+    except Exception as e:
+        log.warning("Send failed to %s: %s", row["chat_id"], e)
 
-def is_admin(uid: int) -> bool:
-    return uid in SET.ADMIN_IDS
+async def reminder_tick(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.utcnow()
+    async with open_db() as db:
+        rows = await due_for_reminder(db, now)
+        for r in rows:
+            await send_single_reminder(context, db, r, now, mark=True)
 
-# ----------------------------
-# Command Handlers
-# ----------------------------
+# --- Fallback scheduler if JobQueue isn't available ---
+async def reminder_loop_fallback(app: Application, interval_hours: int = 24):
+    """Runs reminder-like logic on a simple async loop."""
+    while True:
+        now = datetime.utcnow()
+        try:
+            async with open_db() as db:
+                rows = await due_for_reminder(db, now)
+                for r in rows:
+                    msg = build_reminder_message(r, now)
+                    try:
+                        await app.bot.send_message(chat_id=r["chat_id"], text=msg)
+                        await mark_reminded(db, r["user_id"], now)
+                    except Exception as e:
+                        log.warning("Send failed to %s: %s", r["chat_id"], e)
+        except Exception as e:
+            log.exception("reminder_loop_fallback tick failed: %s", e)
+        await asyncio.sleep(interval_hours * 3600)
+
+# =========================
+# Commands
+# =========================
 HELP_TEXT = (
     "*IPPT Reminder Bot*\n\n"
     "Commands:\n"
     "• /start – register yourself with the bot\n"
-    "• /setbirthday YYYY-MM-DD – set your birthday (month/day are used each year)\n"
-    "• /summary – see your current status & window\n"
+    "• /setbirthday YYYY-MM-DD – set your birthday (month/day used each year)\n"
+    "• /summary – see your status & window\n"
     "• /complete [--date YYYY-MM-DD] – mark IPPT completed (defaults to today)\n"
     "• /uncomplete – clear completion *only if within your 100-day window*\n"
     "• /export – get CSV of all users (admin only)\n"
-    "• /import – upload a CSV in reply to this command (admin only)\n"
+    "• /import – upload a CSV by replying to it with /import (admin only)\n"
     "• /admin_add <telegram_id> – add an admin (admin only)\n"
     "• /admin_remove <telegram_id> – remove an admin (admin only)\n"
-    "• /admin_complete <user_id> [YYYY-MM-DD|--date YYYY-MM-DD] – admin override\n"
+    "• /admin_complete <user_id> [YYYY-MM-DD|--date YYYY-MM-DD] – override (admin only)\n"
+    "• /notify_now [all|<user_id> ...] [--force] – send reminders now (admin only)\n"
     "• /help – show this help\n"
 )
 
@@ -254,12 +315,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     chat = update.effective_chat
-
     async with open_db() as db:
         await upsert_person(
             db, user.id, chat.id, user.username, user.first_name, user.last_name
         )
-
     await update.message.reply_text(
         "Welcome! You’re registered.\n\n" + HELP_TEXT, parse_mode=ParseMode.MARKDOWN
     )
@@ -274,14 +333,10 @@ async def setbirthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2:
         await update.message.reply_text("Usage: /setbirthday YYYY-MM-DD")
         return
-    try:
-        bday = parse_date_arg(args[1]) or parse_date_arg(update.message.text)
-        if not bday:
-            raise ValueError
-    except Exception:
+    bday = parse_date_arg(args[1]) or parse_date_arg(update.message.text)
+    if not bday:
         await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
         return
-
     async with open_db() as db:
         await set_birthday(db, update.effective_user.id, bday)
     await update.message.reply_text(f"Birthday set to {bday.isoformat()} ✅")
@@ -292,17 +347,16 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row or row["birthday"] == "1970-01-01":
         await update.message.reply_text("Set your birthday first: /setbirthday YYYY-MM-DD")
         return
-
     bday = parse_iso_date(row["birthday"])
     ref = today_sgt()
-    in_window, start, end = within_100_day_window(bday, ref)
+    in_window, start_d, end_d = within_100_day_window(bday, ref)
     status = "✅ Completed" if row["completed_on"] else ("🟡 In window" if in_window else "🕒 Out of window")
     completed_on = row["completed_on"] or "—"
     txt = (
         f"*Your status*\n"
         f"Name: {update.effective_user.full_name}\n"
         f"Birthday: {bday.strftime('%Y-%m-%d')}\n"
-        f"Window: {start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}\n"
+        f"Window: {start_d.strftime('%Y-%m-%d')} → {end_d.strftime('%Y-%m-%d')}\n"
         f"Today: {ref.strftime('%Y-%m-%d')}\n"
         f"Completed on: {completed_on}\n"
         f"Status: {status}"
@@ -310,14 +364,12 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # User self-complete
     target_date = parse_date_arg(update.message.text) or today_sgt()
     async with open_db() as db:
         await set_completed(db, update.effective_user.id, target_date)
     await update.message.reply_text(f"Marked completed on {target_date.isoformat()} ✅")
 
 async def uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only allowed if user is within their current 100-day window
     async with open_db() as db:
         row = await get_person(db, update.effective_user.id)
         if not row or row["birthday"] == "1970-01-01":
@@ -373,7 +425,6 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
       /admin_complete <user_id> [YYYY-MM-DD or --date YYYY-MM-DD]
-    Bare YYYY-MM-DD anywhere in the text also works.
     """
     text = update.message.text
     parts = text.split()
@@ -381,7 +432,6 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /admin_complete <user_id> [YYYY-MM-DD|--date YYYY-MM-DD]")
         return
     target_user = int(parts[1])
-    # Find a date token either `--date YYYY-MM-DD` or any bare YYYY-MM-DD
     d = parse_date_arg(text) or today_sgt()
     async with open_db() as db:
         await set_completed(db, target_user, d)
@@ -414,8 +464,6 @@ async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import csv, io
     count = 0
     async with open_db() as db:
-        async with db.execute("SELECT 1") as _:
-            pass  # ensure DB
         reader = csv.DictReader(io.StringIO(raw.decode("utf-8")))
         for row in reader:
             try:
@@ -436,6 +484,7 @@ async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.exception("Failed to import a row: %s", e)
     await update.message.reply_text(f"Imported {count} rows ✅")
 
+# ----- /notify_now (admin-only) -----
 @require_admin
 async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -457,7 +506,7 @@ async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ids = [p for p in parts[1:] if p != "--force"]
 
     async with open_db() as db:
-        # Case 1: no IDs → run normal due logic now (respects interval)
+        # No args: run standard due logic now
         if not ids:
             rows = await due_for_reminder(db, now)
             for r in rows:
@@ -465,11 +514,13 @@ async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Triggered reminders for {len(rows)} user(s).")
             return
 
-        # Case 2: "all" → send to everyone in window & not completed (or force)
+        # "all": send to everyone in-window & not completed (or all if --force)
         if len(ids) == 1 and ids[0].lower() == "all":
             count = 0
             async with db.execute("SELECT * FROM persons") as cur:
                 async for r in cur:
+                    if not r["birthday"] or r["birthday"] == "1970-01-01":
+                        continue
                     if not force:
                         bday = parse_iso_date(r["birthday"])
                         in_window, _, _ = within_100_day_window(bday, now.date())
@@ -480,7 +531,7 @@ async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Sent reminders to {count} user(s){' (forced)' if force else ''}.")
             return
 
-        # Case 3: specific IDs
+        # Specific IDs
         ok, skipped = 0, []
         for sid in ids:
             if not sid.isdigit():
@@ -505,91 +556,13 @@ async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "\nSkipped: " + ", ".join([f"{sid} ({why})" for sid, why in skipped])
         await update.message.reply_text(msg)
 
-
-
-
-
-
-from datetime import datetime
-
-def build_reminder_message(row, ref_dt: datetime) -> str:
-    name = fmt_user(row)
-    bday = parse_iso_date(row["birthday"])
-    _, start, end = within_100_day_window(bday, ref_dt.date())
-    days_left = (end - ref_dt.date()).days
-    return (
-        f"👋 Hi {name}! Your 100-day IPPT window ends on {end.strftime('%Y-%m-%d')}.\n"
-        f"Days left: {days_left}.\n\n"
-        f"Reply /complete to mark done, or /summary to see details."
-    )
-
-async def send_single_reminder(context: ContextTypes.DEFAULT_TYPE, db: aiosqlite.Connection, row, ref_dt: datetime, mark=True):
-    msg = build_reminder_message(row, ref_dt)
-    try:
-        await context.bot.send_message(chat_id=row["chat_id"], text=msg)
-        if mark:
-            await mark_reminded(db, row["user_id"], ref_dt)
-    except Exception as e:
-        log.warning("Send failed to %s: %s", row["chat_id"], e)
-# --- Fallback scheduler if JobQueue isn't available ---
-import asyncio
-from datetime import datetime
-
-async def reminder_loop_fallback(app: Application, interval_hours: int = 24):
-    """Runs reminder_tick-like logic on a simple async loop."""
-    while True:
-        now = datetime.utcnow()
-        try:
-            async with open_db() as db:
-                rows = await due_for_reminder(db, now)
-                for r in rows:
-                    # reuse your helpers (or inline the message)
-                    msg = build_reminder_message(r, now)
-                    try:
-                        await app.bot.send_message(chat_id=r["chat_id"], text=msg)
-                        await mark_reminded(db, r["user_id"], now)
-                    except Exception as e:
-                        log.warning("Send failed to %s: %s", r["chat_id"], e)
-        except Exception as e:
-            log.exception("reminder_loop_fallback tick failed: %s", e)
-        await asyncio.sleep(interval_hours * 3600)
-
-
-# ----------------------------
-# Reminders (job queue)
-# ----------------------------
-async def reminder_tick(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.utcnow()
-    async with open_db() as db:
-        rows = await due_for_reminder(db, now)
-        for r in rows:
-            name = fmt_user(r)
-            bday = parse_iso_date(r["birthday"])
-            _, start, end = within_100_day_window(bday, now.date())
-            days_left = (end - now.date()).days
-            msg = (
-                f"👋 Hi {name}! Your 100-day IPPT window ends on {end.strftime('%Y-%m-%d')}.\n"
-                f"Days left: {days_left}.\n\n"
-                f"Reply /complete to mark done, or /summary to see details."
-            )
-            try:
-                await context.bot.send_message(chat_id=r["chat_id"], text=msg)
-                await mark_reminded(db, r["user_id"], now)
-            except Exception as e:
-                log.warning("Send failed to %s: %s", r["chat_id"], e)
-
-# ----------------------------
+# =========================
 # App bootstrap
-# ----------------------------
+# =========================
 def build_app() -> Application:
     builder = ApplicationBuilder().token(SET.BOT_TOKEN)
-
-    # Optional rate limiter (only if installed)
-    try:
-        from telegram.ext import AIORateLimiter as _AIORateLimiter
-        builder = builder.rate_limiter(_AIORateLimiter())
-    except Exception:
-        pass
+    if _HAS_RL:
+        builder = builder.rate_limiter(_AIORateLimiter())  # only if installed
 
     app = builder.build()
 
@@ -607,14 +580,14 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("import", import_csv))
     app.add_handler(CommandHandler("notify_now", notify_now))
 
-    # Try JobQueue; if missing, we'll start a fallback loop in main()
+    # Schedule reminders if JobQueue exists; else fallback loop in main()
     if app.job_queue is not None:
-        app.job_queue.run_repeating(reminder_tick, interval=timedelta(hours=24), first=10)
+        from datetime import timedelta as _td
+        app.job_queue.run_repeating(reminder_tick, interval=_td(hours=24), first=10)
     else:
-        log.warning("JobQueue not available. A fallback reminder loop will be started in main().")
+        log.warning("JobQueue not available. Fallback reminder loop will be started in main().")
 
     return app
-
 
 async def main():
     app = build_app()
@@ -624,13 +597,12 @@ async def main():
     # Start polling
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-    # Start fallback scheduler if JobQueue isn't available
+    # Fallback scheduler if JobQueue isn't available
     if app.job_queue is None:
         asyncio.create_task(reminder_loop_fallback(app, interval_hours=24))
 
     # Keep the process alive
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     try:
