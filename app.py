@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
 from telegram import Update, InputFile
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
