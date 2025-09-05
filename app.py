@@ -1,1073 +1,546 @@
-# app.py
+import os
+import io
+import csv
 import asyncio
 import logging
-import os
-import re
-import json
-from datetime import datetime, date, timedelta, timezone
-from typing import List, Optional, Tuple
-from contextlib import asynccontextmanager
+import sqlite3
+import secrets
+import string
+from contextlib import closing
+from datetime import date, datetime, timedelta
 
-import aiosqlite
-from dateutil.parser import isoparse
-from pydantic import BaseModel, Field
-from telegram import Update
+import pytz
+from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, ContextTypes,
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
 
-# =========================
-# Optional extras (guards)
-# =========================
-try:
-    from telegram.ext import AIORateLimiter as _AIORateLimiter
-except Exception:
-    _AIORateLimiter = None
-
-# =========================
-# Logging
-# =========================
+# -------------------- Logging --------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | ippt-bot | %(message)s",
 )
 log = logging.getLogger("ippt-bot")
 
-# =========================
-# Settings
-# =========================
-class Settings(BaseModel):
-    BOT_TOKEN: str
-    ADMIN_IDS: List[int] = Field(default_factory=list)
-    DB_PATH: str = "/data/ippt.db"
-    TZ: str = "Asia/Singapore"
-    REMINDER_INTERVAL_DAYS: int = 10
+# -------------------- Config --------------------
+SG_TZ = pytz.timezone("Asia/Singapore")
+DB_PATH = os.environ.get("DB_PATH", "ippt.sqlite3")
+TOKEN = os.environ.get("BOT_TOKEN")  # required
 
-    @classmethod
-    def from_env(cls) -> "Settings":
-        raw_admins = os.getenv("ADMIN_IDS", "")
-        admin_ids: List[int] = []
-        for tok in [t.strip() for t in raw_admins.split(",") if t.strip()]:
-            try:
-                admin_ids.append(int(tok))
-            except ValueError:
-                log.warning("Skipping non-int ADMIN_IDS token: %s", tok)
-        return cls(
-            BOT_TOKEN=os.environ["BOT_TOKEN"],
-            ADMIN_IDS=admin_ids,
-            DB_PATH=os.getenv("DB_PATH", "/data/ippt.db"),
-            TZ=os.getenv("TZ", "Asia/Singapore"),
-            REMINDER_INTERVAL_DAYS=int(os.getenv("REMINDER_INTERVAL_DAYS", "10")),
-        )
-
-SET = Settings.from_env()
-
-# =========================
-# DB schema (SQLite)
-# =========================
-SCHEMA = """
--- Personnel roster (admin-managed)
-CREATE TABLE IF NOT EXISTS persons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    external_id TEXT UNIQUE NOT NULL,
-    birthday TEXT NOT NULL,
-    grp TEXT,
-    user_id INTEGER UNIQUE,
-    chat_id INTEGER,
-    username TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    display_name TEXT,
-    verified_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_persons_user_id ON persons(user_id);
-CREATE INDEX IF NOT EXISTS idx_persons_external_id ON persons(external_id);
-CREATE INDEX IF NOT EXISTS idx_persons_grp ON persons(grp);
-
--- Per-year completion
-CREATE TABLE IF NOT EXISTS completions (
-    external_id TEXT NOT NULL,
-    year INTEGER NOT NULL,
-    completed_on TEXT,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (external_id, year),
-    FOREIGN KEY (external_id) REFERENCES persons(external_id) ON DELETE CASCADE
-);
-
--- Per-year defer reason
-CREATE TABLE IF NOT EXISTS defers (
-    external_id TEXT NOT NULL,
-    year INTEGER NOT NULL,
-    reason TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (external_id, year),
-    FOREIGN KEY (external_id) REFERENCES persons(external_id) ON DELETE CASCADE
-);
-
--- Per-year cycle-level reason (admin note)
-CREATE TABLE IF NOT EXISTS cycle_reasons (
-    external_id TEXT NOT NULL,
-    year INTEGER NOT NULL,
-    reason TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (external_id, year),
-    FOREIGN KEY (external_id) REFERENCES persons(external_id) ON DELETE CASCADE
-);
-
--- Admin audit log
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TEXT NOT NULL,
-    actor_user_id INTEGER NOT NULL,
-    action TEXT NOT NULL,
-    payload TEXT NOT NULL
-);
-"""
-
-@asynccontextmanager
-async def open_db():
-    os.makedirs(os.path.dirname(SET.DB_PATH), exist_ok=True)
-    db = await aiosqlite.connect(SET.DB_PATH)
-    try:
-        db.row_factory = aiosqlite.Row
-        await db.executescript(SCHEMA)
-        await db.commit()
-        yield db
-    finally:
-        await db.close()
-
-# =========================
-# Utilities
-# =========================
-DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def today_sgt() -> date:
-    # SG = UTC+8, no DST
-    return (now_utc() + timedelta(hours=8)).date()
-
-def within_100_day_window(bday: date, ref: date) -> Tuple[bool, date, date]:
-    bday_this_year = bday.replace(year=ref.year)
-    start = bday_this_year
-    end = bday_this_year + timedelta(days=100)
-    return (start <= ref <= end, start, end)
-
-def window_for_year(bday: date, year: int) -> Tuple[date, date]:
-    start = bday.replace(year=year)
-    end = start + timedelta(days=100)
-    return (start, end)
-
-def parse_iso_date(s: str) -> date:
-    return isoparse(s).date()
-
-def parse_date_arg(text: str) -> Optional[date]:
-    m = DATE_RE.search(text or "")
-    if not m: return None
-    try:
-        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    except ValueError:
-        return None
-
-def get_year_arg(parts: List[str], default_year: int) -> int:
-    for p in parts:
-        if p.isdigit() and len(p) == 4:
-            y = int(p)
-            if 1900 <= y <= 3000:
-                return y
-    return default_year
-
-def is_admin(uid: int) -> bool:
-    return uid in SET.ADMIN_IDS
-
-def tokens_from_text(s: str) -> List[str]:
-    raw = re.split(r"[,\s]+", s.strip())
-    return [x for x in raw if x]
-
-async def audit(actor_uid: int, action: str, payload: dict):
-    try:
-        async with open_db() as db:
-            await db.execute(
-                "INSERT INTO audit_log (ts, actor_user_id, action, payload) VALUES (?,?,?,?)",
-                (now_utc().isoformat(), actor_uid, action, json.dumps(payload))
-            )
-            await db.commit()
-    except Exception as e:
-        log.warning("Audit log failed: %s", e)
-
-# =========================
-# DB ops
-# =========================
-async def get_person_by_user(db: aiosqlite.Connection, user_id: int):
-    async with db.execute("SELECT * FROM persons WHERE user_id=?", (user_id,)) as cur:
-        return await cur.fetchone()
-
-async def get_person_by_external(db: aiosqlite.Connection, external_id: str):
-    async with db.execute("SELECT * FROM persons WHERE external_id=?", (external_id,)) as cur:
-        return await cur.fetchone()
-
-async def create_person(db: aiosqlite.Connection, external_id: str, bday: date, grp: Optional[str]):
-    now = now_utc().isoformat()
-    await db.execute(
-        "INSERT INTO persons (external_id, birthday, grp, created_at, updated_at) VALUES (?,?,?,?,?)",
-        (external_id, bday.isoformat(), grp, now, now)
-    )
-    await db.commit()
-
-async def update_birthday_row(db: aiosqlite.Connection, external_id: str, bday: date):
-    now = now_utc().isoformat()
-    await db.execute(
-        "UPDATE persons SET birthday=?, updated_at=? WHERE external_id=?",
-        (bday.isoformat(), now, external_id)
-    )
-    await db.commit()
-
-async def link_user_to_person(
-    db: aiosqlite.Connection,
-    external_id: str,
-    user_id: int,
-    chat_id: int,
-    username: Optional[str],
-    first_name: Optional[str],
-    last_name: Optional[str],
-):
-    now = now_utc().isoformat()
-    await db.execute(
-        """
-        UPDATE persons
-        SET user_id=?, chat_id=?, username=?, first_name=?, last_name=?, verified_at=?, updated_at=?
-        WHERE external_id=?
-        """,
-        (user_id, chat_id, username, first_name, last_name, now, now, external_id),
-    )
-    await db.commit()
-
-async def unlink_user(db: aiosqlite.Connection, external_id: Optional[str]=None, user_id: Optional[int]=None):
-    now = now_utc().isoformat()
-    if external_id:
-        await db.execute("UPDATE persons SET user_id=NULL, chat_id=NULL, updated_at=? WHERE external_id=?",
-                         (now, external_id))
-    elif user_id:
-        await db.execute("UPDATE persons SET user_id=NULL, chat_id=NULL, updated_at=? WHERE user_id=?",
-                         (now, user_id))
-    await db.commit()
-
-async def remove_person(db: aiosqlite.Connection, external_id: str):
-    await db.execute("DELETE FROM persons WHERE external_id=?", (external_id,))
-    await db.commit()
-
-# completions (per year)
-async def set_completion_year(db: aiosqlite.Connection, external_id: str, year: int, when: date):
-    now = now_utc().isoformat()
-    await db.execute("""
-        INSERT INTO completions (external_id, year, completed_on, updated_at)
-        VALUES (?,?,?,?)
-        ON CONFLICT(external_id, year) DO UPDATE SET
-          completed_on=excluded.completed_on,
-          updated_at=excluded.updated_at
-    """, (external_id, year, when.isoformat(), now))
-    await db.commit()
-
-async def clear_completion_year(db: aiosqlite.Connection, external_id: str, year: int):
-    now = now_utc().isoformat()
-    await db.execute("""
-        INSERT INTO completions (external_id, year, completed_on, updated_at)
-        VALUES (?,?,NULL,?)
-        ON CONFLICT(external_id, year) DO UPDATE SET
-          completed_on=NULL,
-          updated_at=excluded.updated_at
-    """, (external_id, year, now))
-    await db.commit()
-
-async def get_completion_year(db: aiosqlite.Connection, external_id: str, year: int) -> Optional[str]:
-    async with db.execute("SELECT completed_on FROM completions WHERE external_id=? AND year=?",
-                          (external_id, year)) as cur:
-        row = await cur.fetchone()
-        return row["completed_on"] if row else None
-
-# defers (per year)
-async def set_defer_reason(db: aiosqlite.Connection, external_id: str, year: int, reason: str):
-    now = now_utc().isoformat()
-    await db.execute("""
-        INSERT INTO defers (external_id, year, reason, updated_at)
-        VALUES (?,?,?,?)
-        ON CONFLICT(external_id, year) DO UPDATE SET
-          reason=excluded.reason,
-          updated_at=excluded.updated_at
-    """, (external_id, year, reason.strip(), now))
-    await db.commit()
-
-async def clear_defer(db: aiosqlite.Connection, external_id: str, year: int):
-    await db.execute("DELETE FROM defers WHERE external_id=? AND year=?", (external_id, year))
-    await db.commit()
-
-async def get_defer(db: aiosqlite.Connection, external_id: str, year: int) -> Optional[str]:
-    async with db.execute("SELECT reason FROM defers WHERE external_id=? AND year=?",
-                          (external_id, year)) as cur:
-        row = await cur.fetchone()
-        return row["reason"] if row else None
-
-# cycle reasons (per year)
-async def set_cycle_reason(db: aiosqlite.Connection, external_id: str, year: int, reason: str):
-    now = now_utc().isoformat()
-    await db.execute("""
-        INSERT INTO cycle_reasons (external_id, year, reason, updated_at)
-        VALUES (?,?,?,?)
-        ON CONFLICT(external_id, year) DO UPDATE SET
-          reason=excluded.reason,
-          updated_at=excluded.updated_at
-    """, (external_id, year, reason.strip(), now))
-    await db.commit()
-
-async def clear_cycle_reason(db: aiosqlite.Connection, external_id: str, year: int):
-    await db.execute("DELETE FROM cycle_reasons WHERE external_id=? AND year=?", (external_id, year))
-    await db.commit()
-
-async def get_cycle_reason(db: aiosqlite.Connection, external_id: str, year: int) -> Optional[str]:
-    async with db.execute("SELECT reason FROM cycle_reasons WHERE external_id=? AND year=?",
-                          (external_id, year)) as cur:
-        row = await cur.fetchone()
-        return row["reason"] if row else None
-
-# =========================
-# Reminders
-# =========================
-def display_name(row) -> str:
-    if row["display_name"]:
-        return row["display_name"]
-    parts = []
-    if row["first_name"]: parts.append(row["first_name"])
-    if row["last_name"]: parts.append(row["last_name"])
-    if parts: return " ".join(parts)
-    return row["username"] or row["external_id"]
-
-def build_reminder_message(person_row, ref_dt: datetime, completed_on: Optional[str], defer_reason: Optional[str]) -> str:
-    who = display_name(person_row)
-    bday = parse_iso_date(person_row["birthday"])
-    _, _, end = within_100_day_window(bday, ref_dt.date())
-    days_left = (end - ref_dt.date()).days
-    if completed_on:
-        status_line = f"Status: ✅ Completed on {completed_on}\n"
-    elif defer_reason:
-        status_line = f"Status: ⏸️ Deferred – {defer_reason}\n"
-    else:
-        status_line = "Status: 🔔 Pending\n"
-    return (
-        f"👋 Hi {who}! Your 100-day IPPT window ends on {end.strftime('%Y-%m-%d')}.\n"
-        f"Days left: {days_left}.\n{status_line}\n"
-        f"Reply /complete to mark done, or /summary to see details."
-    )
-
-async def send_single_reminder(context: ContextTypes.DEFAULT_TYPE, db: aiosqlite.Connection, person_row, ref_dt: datetime, year: int):
-    completed_on = await get_completion_year(db, person_row["external_id"], year)
-    defer_reason = await get_defer(db, person_row["external_id"], year)
-    msg = build_reminder_message(person_row, ref_dt, completed_on, defer_reason)
-    try:
-        await context.bot.send_message(chat_id=person_row["chat_id"], text=msg)
-        await audit(0, "auto_remind", {"external_id": person_row["external_id"], "year": year})
-    except Exception as e:
-        log.warning("Send failed to %s: %s", person_row["chat_id"], e)
-
-async def due_for_reminder(db: aiosqlite.Connection, ref_dt: datetime, year: int):
-    due = []
-    async with db.execute("SELECT * FROM persons WHERE user_id IS NOT NULL") as cur:
-        async for r in cur:
-            if not r["birthday"]:
-                continue
-            bday = parse_iso_date(r["birthday"])
-            ref = ref_dt.date()
-            in_window, _, _ = within_100_day_window(bday, ref)
-            if not in_window:
-                continue
-            if await get_completion_year(db, r["external_id"], year):
-                continue
-            if await get_defer(db, r["external_id"], year):
-                continue
-            due.append(r)
-    return due
-
-async def reminder_tick(context: ContextTypes.DEFAULT_TYPE):
-    now = now_utc()
-    year = now.year
-    async with open_db() as db:
-        rows = await due_for_reminder(db, now, year)
-        for r in rows:
-            await send_single_reminder(context, db, r, now, year)
-
-# Fallback loop if JobQueue not available
-async def reminder_loop_fallback(app: Application, interval_hours: int = 24):
-    while True:
-        now = now_utc()
-        year = now.year
-        try:
-            async with open_db() as db:
-                rows = await due_for_reminder(db, now, year)
-                for r in rows:
-                    # mimic send_single_reminder without context (use app.bot)
-                    completed_on = await get_completion_year(db, r["external_id"], year)
-                    defer_reason = await get_defer(db, r["external_id"], year)
-                    msg = build_reminder_message(r, now, completed_on, defer_reason)
-                    try:
-                        await app.bot.send_message(chat_id=r["chat_id"], text=msg)
-                        await audit(0, "auto_remind", {"external_id": r["external_id"], "year": year})
-                    except Exception as e:
-                        log.warning("Send failed to %s: %s", r["chat_id"], e)
-        except Exception as e:
-            log.exception("reminder_loop_fallback tick failed: %s", e)
-        await asyncio.sleep(interval_hours * 3600)
-
-# =========================
-# Guards
-# =========================
-def require_admin(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else 0
-        if not is_admin(uid):
-            await update.effective_message.reply_text("Admin only.")
-            return
-        return await func(update, context)
-    return wrapper
-
-def require_verified(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        async with open_db() as db:
-            row = await get_person_by_user(db, update.effective_user.id)
-        if not row:
-            await update.effective_message.reply_text(
-                "You are not verified yet. Use:\n"
-                "<code>/verify &lt;ID&gt; &lt;YYYY-MM-DD&gt;</code>\n"
-                "Example: <code>/verify 001A 1997-05-03</code>",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        return await func(update, context)
-    return wrapper
-
-# =========================
-# Help text (HTML)
-# =========================
-HELP_TEXT = (
-    "<b>IPPT Reminder Bot</b>\n\n"
-    "<b>User:</b>\n"
-    "• <code>/start</code> – get started\n"
-    "• <code>/verify &lt;ID&gt; &lt;YYYY-MM-DD&gt;</code> – verify against roster\n"
-    "• <code>/setname &lt;name&gt;</code> – set how I address you\n"
-    "• <code>/summary</code> – see your status &amp; window\n"
-    "• <code>/complete [YYYY-MM-DD]</code> – mark IPPT completed (today if no date)\n\n"
-    "<b>Admin:</b>\n"
-    "• <code>/whoami</code>\n"
-    "• <code>/add_personnel &lt;ID&gt; &lt;YYYY-MM-DD&gt; [GROUP]</code>\n"
-    "• <code>/update_birthday &lt;ID&gt; &lt;YYYY-MM-DD&gt;</code>\n"
-    "• <code>/import_csv</code> (reply with CSV: <i>external_id,birthday[,group]</i>)\n"
-    "• <code>/report [GROUP] [YEAR]</code>\n"
-    "• <code>/export</code>\n"
-    "• <code>/defer_reason  &lt;tokens&gt; [YEAR] -- &lt;reason&gt;</code>\n"
-    "• <code>/defer_reset   &lt;tokens&gt; [YEAR]</code>\n"
-    "• <code>/admin_complete   &lt;tokens&gt; [YEAR] [--date YYYY-MM-DD]</code>\n"
-    "• <code>/admin_uncomplete &lt;tokens&gt; [YEAR]</code>\n"
-    "• <code>/cycle_reason &lt;tokens&gt; [YEAR] -- &lt;reason&gt;</code>\n"
-    "• <code>/cycle_reason_clear &lt;tokens&gt; [YEAR]</code>\n"
-    "• <code>/unlink_user &lt;tokens&gt;</code>\n"
-    "• <code>/remove_personnel &lt;ID[,ID,...]&gt;</code>\n"
-    "• <code>/defer_audit [LIMIT]</code>\n"
-    "• <code>/notify_now [all|&lt;ID&gt; ...] [--force]</code>\n"
+REMINDER_HOUR_LOCAL = 9      # 09:00 Asia/Singapore
+WINDOW_DAYS = 100            # IPPT window length after birthday
+TOKEN_LEN = 6                # admin token length (alphanumeric)
+ENV_ADMIN_IDS = set(
+    int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 )
 
-# =========================
-# User commands
-# =========================
+# -------------------- DB Helpers --------------------
+def init_db():
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER PRIMARY KEY,
+            username TEXT,
+            name TEXT,              -- free-text user display name
+            birthday TEXT,          -- YYYY-MM-DD
+            last_completed TEXT,    -- YYYY-MM-DD (last IPPT completion date)
+            reminders_enabled INTEGER DEFAULT 1,
+            last_reminded_on TEXT,  -- YYYY-MM-DD (SG local date)
+            token TEXT UNIQUE,      -- admin token to act on user
+            is_admin INTEGER DEFAULT 0
+        );
+        """)
+        # backfill token/is_admin/name for existing rows
+        cur = con.execute("SELECT chat_id, token FROM users")
+        rows = cur.fetchall()
+        for chat_id, tok in rows:
+            if not tok:
+                con.execute("UPDATE users SET token=? WHERE chat_id=?", (generate_token(), chat_id))
+        # elevate env admins
+        if ENV_ADMIN_IDS:
+            con.executemany("UPDATE users SET is_admin=1 WHERE chat_id=?", [(i,) for i in ENV_ADMIN_IDS])
+        con.commit()
+
+def generate_token(n: int = TOKEN_LEN) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+def upsert_user(chat_id: int, username: str | None):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+        INSERT INTO users (chat_id, username, token)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET username=excluded.username;
+        """, (chat_id, username, generate_token()))
+        # Ensure token exists even on update
+        con.execute("""
+        UPDATE users SET token=COALESCE(token, ?)
+        WHERE chat_id=?;
+        """, (generate_token(), chat_id))
+        con.commit()
+
+def set_birthday(chat_id: int, birthday_str: str):
+    _ = date.fromisoformat(birthday_str)  # validate
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE users SET birthday=? WHERE chat_id=?", (birthday_str, chat_id))
+        con.commit()
+
+def set_name(chat_id: int, name: str):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE users SET name=? WHERE chat_id=?", (name, chat_id))
+        con.commit()
+
+def set_completed(chat_id: int, completed_str: str | None):
+    if completed_str:
+        _ = date.fromisoformat(completed_str)  # validate
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE users SET last_completed=? WHERE chat_id=?", (completed_str, chat_id))
+        con.commit()
+
+def set_reminders_enabled(chat_id: int, enabled: bool):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE users SET reminders_enabled=? WHERE chat_id=?", (1 if enabled else 0, chat_id))
+        con.commit()
+
+def set_admin(chat_id: int, is_admin: bool):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE users SET is_admin=? WHERE chat_id=?", (1 if is_admin else 0, chat_id))
+        con.commit()
+
+def get_user(chat_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def get_user_by_token(token: str) -> dict | None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute("SELECT * FROM users WHERE token=?", (token,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def list_users() -> list[dict]:
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute("SELECT * FROM users")
+        return [dict(r) for r in cur.fetchall()]
+
+def mark_reminded_today(chat_id: int, sg_today: date):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE users SET last_reminded_on=? WHERE chat_id=?", (sg_today.isoformat(), chat_id))
+        con.commit()
+
+# -------------------- IPPT Logic --------------------
+def season_birthday(birthday_mmdd: tuple[int, int], year: int) -> date:
+    m, d = birthday_mmdd
+    try:
+        return date(year, m, d)
+    except ValueError:
+        if m == 2 and d == 29:
+            return date(year, 2, 28)
+        raise
+
+def compute_season(today_sg: date, birthday_str: str, year: int | None = None) -> tuple[date, date]:
+    bday = date.fromisoformat(birthday_str)
+    mmdd = (bday.month, bday.day)
+    yy = year if year is not None else today_sg.year
+    start = season_birthday(mmdd, yy)
+    end = start + timedelta(days=WINDOW_DAYS)
+    return start, end
+
+def compute_status(today_sg: date, birthday_str: str | None, last_completed_str: str | None, year: int | None = None) -> dict:
+    if not birthday_str:
+        return {"ok": False, "state": "not_set", "bday": None, "start": None, "end": None, "days_left": None}
+
+    start, end = compute_season(today_sg, birthday_str, year)
+    last_completed = date.fromisoformat(last_completed_str) if last_completed_str else None
+
+    # Completed for this season?
+    if last_completed and last_completed >= start:
+        return {"ok": False, "state": "completed", "start": start, "end": end, "days_left": max(0, (end - today_sg).days)}
+
+    if today_sg < start:
+        return {"ok": False, "state": "pre_window", "start": start, "end": end, "days_left": (end - today_sg).days}
+
+    if start <= today_sg <= end:
+        return {"ok": True, "state": "in_window", "start": start, "end": end, "days_left": (end - today_sg).days}
+
+    return {"ok": True, "state": "overdue", "start": start, "end": end, "days_left": -1}
+
+def fmt_status_summary(today_sg: date, user: dict, year: int | None = None) -> str:
+    st = compute_status(today_sg, user.get("birthday"), user.get("last_completed"), year)
+    if st["state"] == "not_set":
+        return "⚠️ Birthday not set. Use /setbirthday YYYY-MM-DD"
+    if st["state"] == "pre_window":
+        return (f"🎂 Season: {st['start'].isoformat()} → {st['end'].isoformat()}\n"
+                f"🟡 Window opens on your birthday and lasts {WINDOW_DAYS} days.\n"
+                f"⏳ Days until window ends: {st['days_left']}")
+    if st["state"] == "in_window":
+        return (f"✅ In window ({st['start'].isoformat()} → {st['end'].isoformat()})\n"
+                f"⏳ Days left: {st['days_left']}\n"
+                f"Mark complete when done: /complete YYYY-MM-DD")
+    if st["state"] == "completed":
+        return (f"🎉 Completed this season. Window: {st['start'].isoformat()} → {st['end'].isoformat()}")
+    if st["state"] == "overdue":
+        return (f"🔴 Overdue! Window ended on {st['end'].isoformat()}.\n"
+                f"Please complete ASAP and mark it: /complete YYYY-MM-DD")
+    return "Unknown state."
+
+# -------------------- Auth Helpers --------------------
+def is_admin_chat(chat_id: int) -> bool:
+    usr = get_user(chat_id)
+    return bool(usr and usr.get("is_admin", 0) == 1)
+
+def require_admin(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        if not is_admin_chat(chat_id):
+            await update.effective_message.reply_text("🚫 Admins only.")
+            return
+        return await func(update, context)
+    return wrapper
+
+# -------------------- Bot Commands --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Welcome!\n\n"
-        "Please verify yourself with:\n"
-        "<code>/verify &lt;ID&gt; &lt;YYYY-MM-DD&gt;</code>\n"
-        "Example: <code>/verify 001A 1997-05-03</code>\n\n" + HELP_TEXT,
-        parse_mode=ParseMode.HTML
+    upsert_user(update.effective_chat.id, update.effective_user.username)
+    msg = (
+        "👋 Hello! I’ll remind you to complete your IPPT within 100 days after your birthday.\n\n"
+        "Setup:\n"
+        "• /setbirthday YYYY-MM-DD  – set/update your birthday\n"
+        "• /setname Your Name       – optional display name (not validated)\n"
+        "• /complete YYYY-MM-DD     – mark IPPT done\n"
+        "• /uncomplete              – clear completion (allowed only if still in window)\n"
+        "• /summary                 – see your status\n"
+        "• /whoami                  – show your saved info & admin token\n"
+        "• /pause /resume           – toggle reminders\n"
+        "• /test_reminder           – send a test reminder now\n\n"
+        "Admin:\n"
+        "• /admin_complete <TOKEN> [YEAR] [--date YYYY-MM-DD]\n"
+        "• /admin_uncomplete <TOKEN> [YEAR]\n"
+        "• /admin_export [YEAR]\n"
+        "• /admin_add <chat_id>, /admin_remove <chat_id>, /admin_list\n"
     )
+    await update.effective_message.reply_text(msg)
 
-async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
-    parts = (update.message.text or "").split()
-    if len(parts) != 3:
-        await update.message.reply_text(
-            "Usage: <code>/verify &lt;ID&gt; &lt;YYYY-MM-DD&gt;</code>\nExample: <code>/verify 001A 1997-05-03</code>",
-            parse_mode=ParseMode.HTML
-        )
+async def setbirthday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /setbirthday YYYY-MM-DD")
         return
-    external_id = parts[1].strip()
-    bday = parse_date_arg(parts[2])
-    if not bday:
-        await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
+    try:
+        set_birthday(update.effective_chat.id, context.args[0])
+    except Exception as e:
+        await update.effective_message.reply_text(f"❌ Invalid date. Use YYYY-MM-DD. Error: {e}")
         return
-    async with open_db() as db:
-        person = await get_person_by_external(db, external_id)
-        if not person or parse_iso_date(person["birthday"]) != bday:
-            await update.message.reply_text("No matching record. Check your ID & birthday.")
-            return
-        if person["user_id"] and person["user_id"] != update.effective_user.id:
-            await update.message.reply_text("This ID is already verified by another Telegram account.")
-            return
-        await link_user_to_person(
-            db, external_id, update.effective_user.id, update.effective_chat.id,
-            update.effective_user.username, update.effective_user.first_name, update.effective_user.last_name
-        )
-        await audit(update.effective_user.id, "verify", {"external_id": external_id})
-    await update.message.reply_text(
-        "Verification successful ✅\nYou can now <code>/setname</code>, <code>/summary</code>, and <code>/complete</code>.",
-        parse_mode=ParseMode.HTML
-    )
 
-@require_verified
-async def setname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
-    name = update.message.text.partition(" ")[2].strip()
-    if not name:
-        await update.message.reply_text("Usage: <code>/setname &lt;your preferred name&gt;</code>", parse_mode=ParseMode.HTML)
+    usr = get_user(update.effective_chat.id)
+    sg_today = datetime.now(SG_TZ).date()
+    await update.effective_message.reply_text(f"✅ Birthday set to {context.args[0]}\n\n{fmt_status_summary(sg_today, usr)}")
+
+async def setname_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /setname Your Name")
         return
-    if len(name) > 50:
-        await update.message.reply_text("Name too long. Keep within 50 characters.")
+    name = " ".join(context.args).strip()
+    set_name(update.effective_chat.id, name[:120])
+    await update.effective_message.reply_text(f"✅ Name saved: {name}")
+
+async def complete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /complete YYYY-MM-DD\n(Use the actual completion date.)")
         return
-    async with open_db() as db:
-        now = now_utc().isoformat()
-        await db.execute("UPDATE persons SET display_name=?, updated_at=? WHERE user_id=?",
-                         (name, now, update.effective_user.id))
-        await db.commit()
-    await update.message.reply_text(f"Okay! I’ll call you <b>{name}</b> ✅", parse_mode=ParseMode.HTML)
-
-@require_verified
-async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with open_db() as db:
-        row = await get_person_by_user(db, update.effective_user.id)
-        bday = parse_iso_date(row["birthday"])
-        ref = today_sgt()
-        in_window, start_d, end_d = within_100_day_window(bday, ref)
-        year = ref.year
-        completed_on = await get_completion_year(db, row["external_id"], year)
-        defer_reason = await get_defer(db, row["external_id"], year)
-    status = ("✅ Completed" if completed_on else
-              ("⏸️ Deferred" if defer_reason else ("🟡 In window" if in_window else "🕒 Out of window")))
-    who = display_name(row)
-    completed = completed_on or "—"
-    defer_txt = defer_reason or "—"
-    txt = (
-        f"<b>Your status</b>\n"
-        f"ID: {row['external_id']}\n"
-        f"Name: {who}\n"
-        f"Birthday (roster): {bday.strftime('%Y-%m-%d')}\n"
-        f"Window: {start_d.strftime('%Y-%m-%d')} → {end_d.strftime('%Y-%m-%d')}\n"
-        f"Today: {ref.strftime('%Y-%m-%d')}\n"
-        f"Completed on ({year}): {completed}\n"
-        f"Defer reason ({year}): {defer_txt}\n"
-        f"Status: {status}"
-    )
-    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
-
-@require_verified
-async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = parse_date_arg(update.message.text) or today_sgt()
-    year = d.year
-    async with open_db() as db:
-        person = await get_person_by_user(db, update.effective_user.id)
-        await set_completion_year(db, person["external_id"], year, d)
-        await audit(update.effective_user.id, "complete_self",
-                    {"external_id": person["external_id"], "year": year, "date": d.isoformat()})
-    await update.message.reply_text(f"Marked completed on {d.isoformat()} ✅")
-
-# =========================
-# Admin commands
-# =========================
-@require_admin
-async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Admin ✅\nYour Telegram ID: {update.effective_user.id}")
-
-@require_admin
-async def add_personnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = (update.message.text or "").split()
-    if len(parts) < 3:
-        await update.message.reply_text(
-            "Usage: <code>/add_personnel &lt;ID&gt; &lt;YYYY-MM-DD&gt; [GROUP]</code>",
-            parse_mode=ParseMode.HTML
-        ); return
-    external_id = parts[1]
-    bday = parse_date_arg(parts[2])
-    grp = parts[3] if len(parts) >= 4 else None
-    if not bday:
-        await update.message.reply_text("Invalid date. Use YYYY-MM-DD."); return
-    async with open_db() as db:
-        if await get_person_by_external(db, external_id):
-            await update.message.reply_text("That ID already exists."); return
-        await create_person(db, external_id, bday, grp)
-        await audit(update.effective_user.id, "add_personnel",
-                    {"external_id": external_id, "birthday": bday.isoformat(), "group": grp})
-    await update.message.reply_text(f"Added {external_id} (birthday {bday.isoformat()}{', group '+grp if grp else ''}) ✅")
-
-@require_admin
-async def update_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = (update.message.text or "").split()
-    if len(parts) != 3:
-        await update.message.reply_text(
-            "Usage: <code>/update_birthday &lt;ID&gt; &lt;YYYY-MM-DD&gt;</code>",
-            parse_mode=ParseMode.HTML
-        ); return
-    external_id = parts[1]
-    bday = parse_date_arg(parts[2])
-    if not bday:
-        await update.message.reply_text("Invalid date."); return
-    async with open_db() as db:
-        if not await get_person_by_external(db, external_id):
-            await update.message.reply_text("No such ID."); return
-        await update_birthday_row(db, external_id, bday)
-        await audit(update.effective_user.id, "update_birthday",
-                    {"external_id": external_id, "birthday": bday.isoformat()})
-    await update.message.reply_text(f"Updated {external_id} birthday → {bday.isoformat()} ✅")
-
-@require_admin
-async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Reply to a CSV with headers: external_id,birthday[,group]
-    """
-    if not update.message or not update.message.reply_to_message or not update.message.reply_to_message.document:
-        await update.message.reply_text(
-            "Reply to a CSV file with <code>/import_csv</code>.\nHeaders: <i>external_id,birthday[,group]</i>",
-            parse_mode=ParseMode.HTML
-        ); return
-    doc = update.message.reply_to_message.document
-    file = await doc.get_file()
-    raw = await file.download_as_bytearray()
-    import csv, io
-    count = 0
-    async with open_db() as db:
-        reader = csv.DictReader(io.StringIO(raw.decode("utf-8")))
-        now = now_utc().isoformat()
-        for row in reader:
-            ext = (row.get("external_id") or "").strip()
-            bday_s = (row.get("birthday") or "").strip()
-            grp = (row.get("group") or "").strip() or None
-            if not ext or not bday_s:
-                continue
-            try:
-                bday = parse_iso_date(bday_s)
-            except Exception:
-                continue
-            exists = await get_person_by_external(db, ext)
-            if exists:
-                await db.execute("UPDATE persons SET birthday=?, grp=?, updated_at=? WHERE external_id=?",
-                                 (bday.isoformat(), grp, now, ext))
-            else:
-                await db.execute("INSERT INTO persons (external_id, birthday, grp, created_at, updated_at) VALUES (?,?,?,?,?)",
-                                 (ext, bday.isoformat(), grp, now, now))
-            count += 1
-        await db.commit()
-    await audit(update.effective_user.id, "import_csv", {"count": count})
-    await update.message.reply_text(f"Imported/updated {count} personnel ✅")
-
-@require_admin
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /report [GROUP] [YEAR]
-    Generates CSV: external_id,group,name,birthday,window_start,window_end,completed_on,defer_reason,cycle_reason,status
-    """
-    parts = (update.message.text or "").split()
-    group = None
-    year = today_sgt().year
-    for p in parts[1:]:
-        if p.isdigit() and len(p) == 4:
-            year = int(p)
-        else:
-            group = p
-
-    import csv
-    from io import StringIO
-    out = StringIO()
-    w = csv.writer(out)
-    w.writerow(["external_id","group","name","birthday","window_start","window_end","completed_on","defer_reason","cycle_reason","status"])
-
-    async with open_db() as db:
-        q = "SELECT * FROM persons"
-        params = []
-        if group:
-            q += " WHERE grp=?"
-            params.append(group)
-        async with db.execute(q, params) as cur:
-            async for r in cur:
-                bday = parse_iso_date(r["birthday"])
-                win_start, win_end = window_for_year(bday, year)
-                comp = await get_completion_year(db, r["external_id"], year)
-                defer = await get_defer(db, r["external_id"], year)
-                cyc = await get_cycle_reason(db, r["external_id"], year)
-                status = "COMPLETED" if comp else ("DEFERRED" if defer else "DUE")
-                w.writerow([
-                    r["external_id"], r["grp"] or "", display_name(r), r["birthday"],
-                    win_start.isoformat(), win_end.isoformat(), comp or "", defer or "", cyc or "", status
-                ])
-    out.seek(0)
-    await update.message.reply_document(
-        document=out.getvalue().encode("utf-8"),
-        filename=f"report_{group or 'ALL'}_{year}.csv",
-        caption=f"Report ({group or 'ALL'}, {year})"
-    )
-
-@require_admin
-async def export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /export → ZIP with: persons.csv, completions.csv, defers.csv, cycle_reasons.csv
-    """
-    import csv
-    import io
-    import zipfile
-
-    persons_buf = io.StringIO()
-    comp_buf = io.StringIO()
-    defer_buf = io.StringIO()
-    cycle_buf = io.StringIO()
-
-    async with open_db() as db:
-        persons_cols = ["external_id","birthday","grp","user_id","chat_id","username","first_name","last_name","display_name","verified_at","created_at","updated_at"]
-        pw = csv.writer(persons_buf)
-        pw.writerow(persons_cols)
-        async with db.execute(f"SELECT {', '.join(persons_cols)} FROM persons ORDER BY external_id ASC") as cur:
-            async for r in cur:
-                pw.writerow([r[c] if r[c] is not None else "" for c in persons_cols])
-
-        comp_cols = ["external_id","year","completed_on","updated_at"]
-        cw = csv.writer(comp_buf)
-        cw.writerow(comp_cols)
-        async with db.execute(f"SELECT {', '.join(comp_cols)} FROM completions ORDER BY external_id, year") as cur:
-            async for r in cur:
-                cw.writerow([r[c] if r[c] is not None else "" for c in comp_cols])
-
-        defer_cols = ["external_id","year","reason","updated_at"]
-        dw = csv.writer(defer_buf)
-        dw.writerow(defer_cols)
-        async with db.execute(f"SELECT {', '.join(defer_cols)} FROM defers ORDER BY external_id, year") as cur:
-            async for r in cur:
-                dw.writerow([r[c] if r[c] is not None else "" for c in defer_cols])
-
-        cycle_cols = ["external_id","year","reason","updated_at"]
-        cyw = csv.writer(cycle_buf)
-        cyw.writerow(cycle_cols)
-        async with db.execute(f"SELECT {', '.join(cycle_cols)} FROM cycle_reasons ORDER BY external_id, year") as cur:
-            async for r in cur:
-                cyw.writerow([r[c] if r[c] is not None else "" for c in cycle_cols])
-
-    persons_buf.seek(0); comp_buf.seek(0); defer_buf.seek(0); cycle_buf.seek(0)
-    zip_bytes = io.BytesIO()
-    with zipfile.ZipFile(zip_bytes, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("persons.csv", persons_buf.getvalue())
-        zf.writestr("completions.csv", comp_buf.getvalue())
-        zf.writestr("defers.csv", defer_buf.getvalue())
-        zf.writestr("cycle_reasons.csv", cycle_buf.getvalue())
-    zip_bytes.seek(0)
-
-    ts = now_utc().strftime("%Y%m%d_%H%M%S")
-    await update.message.reply_document(
-        document=zip_bytes.getvalue(),
-        filename=f"ippt_export_{ts}.zip",
-        caption="Exported data"
-    )
-
-def _split_reason(text: str) -> Tuple[str, Optional[str]]:
-    if " -- " in text:
-        before, _, after = text.partition(" -- ")
-        return before.strip(), after.strip()
-    return text.strip(), None
-
-def _targets_and_year(text: str, default_year: int) -> Tuple[List[str], int]:
-    before, _ = _split_reason(text)
-    parts = tokens_from_text(before)
-    year = get_year_arg(parts, default_year)
-    parts = [p for p in parts if not (p.isdigit() and len(p) == 4 and int(p) == year)]
-    return parts, year
-
-@require_admin
-async def defer_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    default_year = today_sgt().year
-    text = (update.message.text or "").removeprefix("/defer_reason").strip()
-    before, reason = _split_reason(text)
-    if not reason:
-        await update.message.reply_text("Usage: <code>/defer_reason &lt;tokens&gt; [YEAR] -- &lt;reason&gt;</code>", parse_mode=ParseMode.HTML)
+    try:
+        set_completed(update.effective_chat.id, context.args[0])
+    except Exception as e:
+        await update.effective_message.reply_text(f"❌ Invalid date. Use YYYY-MM-DD. Error: {e}")
         return
-    tokens, year = _targets_and_year(text, default_year)
-    if not tokens:
-        await update.message.reply_text("No targets found.")
+
+    usr = get_user(update.effective_chat.id)
+    sg_today = datetime.now(SG_TZ).date()
+    await update.effective_message.reply_text(f"🎉 Marked completed on {context.args[0]}.\n\n{fmt_status_summary(sg_today, usr)}")
+
+async def uncomplete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usr = get_user(update.effective_chat.id)
+    if not usr:
+        await update.effective_message.reply_text("You’re not registered. Use /start first.")
         return
-    async with open_db() as db:
-        for tok in tokens:
-            if not await get_person_by_external(db, tok):
-                continue
-            await set_defer_reason(db, tok, year, reason)
-            await audit(update.effective_user.id, "defer_reason", {"external_id": tok, "year": year, "reason": reason})
-    await update.message.reply_text(f"Set defer reason for {len(tokens)} id(s) in {year} ✅")
-
-@require_admin
-async def defer_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    default_year = today_sgt().year
-    text = (update.message.text or "").removeprefix("/defer_reset").strip()
-    tokens, year = _targets_and_year(text, default_year)
-    if not tokens:
-        await update.message.reply_text("Usage: <code>/defer_reset &lt;tokens&gt; [YEAR]</code>", parse_mode=ParseMode.HTML)
+    if not usr.get("birthday"):
+        await update.effective_message.reply_text("Set your birthday first: /setbirthday YYYY-MM-DD")
         return
-    async with open_db() as db:
-        for tok in tokens:
-            if not await get_person_by_external(db, tok):
-                continue
-            await clear_defer(db, tok, year)
-            await audit(update.effective_user.id, "defer_reset", {"external_id": tok, "year": year})
-    await update.message.reply_text(f"Cleared defer reason for {len(tokens)} id(s) in {year} ✅")
-
-@require_admin
-async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").removeprefix("/admin_complete").strip()
-    parts = tokens_from_text(text)
-    default_year = today_sgt().year
-    year = get_year_arg(parts, default_year)
-    m = re.search(r"--date\s+(\d{4}-\d{2}-\d{2})", text)
-    d = parse_iso_date(m.group(1)) if m else (parse_date_arg(text) or today_sgt())
-    ids = [p for p in parts if not (p.isdigit() and len(p)==4 and int(p)==year) and p != "--date" and not DATE_RE.fullmatch(p)]
-    if not ids:
-        await update.message.reply_text("Usage: <code>/admin_complete &lt;tokens&gt; [YEAR] [--date YYYY-MM-DD]</code>", parse_mode=ParseMode.HTML)
-        return
-    async with open_db() as db:
-        done = 0
-        for tok in ids:
-            if not await get_person_by_external(db, tok):
-                continue
-            await set_completion_year(db, tok, year, d)
-            await audit(update.effective_user.id, "admin_complete",
-                        {"external_id": tok, "year": year, "date": d.isoformat()})
-            done += 1
-    await update.message.reply_text(f"Completed {done} id(s) for {year} on {d.isoformat()} ✅")
-
-@require_admin
-async def admin_uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").removeprefix("/admin_uncomplete").strip()
-    parts = tokens_from_text(text)
-    default_year = today_sgt().year
-    year = get_year_arg(parts, default_year)
-    ids = [p for p in parts if not (p.isdigit() and len(p)==4 and int(p)==year)]
-    if not ids:
-        await update.message.reply_text("Usage: <code>/admin_uncomplete &lt;tokens&gt; [YEAR]</code>", parse_mode=ParseMode.HTML)
-        return
-    async with open_db() as db:
-        done = 0
-        for tok in ids:
-            if not await get_person_by_external(db, tok):
-                continue
-            await clear_completion_year(db, tok, year)
-            await audit(update.effective_user.id, "admin_uncomplete", {"external_id": tok, "year": year})
-            done += 1
-    await update.message.reply_text(f"Cleared completion for {done} id(s) in {year} ✅")
-
-@require_admin
-async def cycle_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    default_year = today_sgt().year
-    text = (update.message.text or "").removeprefix("/cycle_reason").strip()
-    before, reason = _split_reason(text)
-    if not reason:
-        await update.message.reply_text("Usage: <code>/cycle_reason &lt;tokens&gt; [YEAR] -- &lt;reason&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-    tokens, year = _targets_and_year(text, default_year)
-    if not tokens:
-        await update.message.reply_text("No targets found.")
-        return
-    async with open_db() as db:
-        for tok in tokens:
-            if not await get_person_by_external(db, tok):
-                continue
-            await set_cycle_reason(db, tok, year, reason)
-            await audit(update.effective_user.id, "cycle_reason", {"external_id": tok, "year": year, "reason": reason})
-    await update.message.reply_text(f"Set cycle reason for {len(tokens)} id(s) in {year} ✅")
-
-@require_admin
-async def cycle_reason_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").removeprefix("/cycle_reason_clear").strip()
-    parts = tokens_from_text(text)
-    default_year = today_sgt().year
-    year = get_year_arg(parts, default_year)
-    ids = [p for p in parts if not (p.isdigit() and len(p)==4 and int(p)==year)]
-    if not ids:
-        await update.message.reply_text("Usage: <code>/cycle_reason_clear &lt;tokens&gt; [YEAR]</code>", parse_mode=ParseMode.HTML)
-        return
-    async with open_db() as db:
-        for tok in ids:
-            if not await get_person_by_external(db, tok):
-                continue
-            await clear_cycle_reason(db, tok, year)
-            await audit(update.effective_user.id, "cycle_reason_clear", {"external_id": tok, "year": year})
-    await update.message.reply_text(f"Cleared cycle reason for {len(ids)} id(s) in {year} ✅")
-
-@require_admin
-async def unlink_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").removeprefix("/unlink_user").strip()
-    tokens = tokens_from_text(text)
-    if not tokens:
-        await update.message.reply_text("Usage: <code>/unlink_user &lt;external_id|user_id&gt; [more ...]</code>", parse_mode=ParseMode.HTML)
-        return
-    async with open_db() as db:
-        done = 0
-        for tok in tokens:
-            if tok.isdigit():
-                await unlink_user(db, user_id=int(tok)); done += 1
-                await audit(update.effective_user.id, "unlink_user_by_telegram", {"user_id": int(tok)})
-            else:
-                if await get_person_by_external(db, tok):
-                    await unlink_user(db, external_id=tok); done += 1
-                    await audit(update.effective_user.id, "unlink_user_by_external", {"external_id": tok})
-    await update.message.reply_text(f"Unlinked {done} record(s) ✅")
-
-@require_admin
-async def remove_personnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").removeprefix("/remove_personnel").strip()
-    ids = tokens_from_text(text)
-    if not ids:
-        await update.message.reply_text("Usage: <code>/remove_personnel &lt;ID[,ID,...]&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-    async with open_db() as db:
-        done = 0
-        for ext in ids:
-            if await get_person_by_external(db, ext):
-                await remove_person(db, ext); done += 1
-                await audit(update.effective_user.id, "remove_personnel", {"external_id": ext})
-    await update.message.reply_text(f"Removed {done} personnel record(s) ✅")
-
-@require_admin
-async def defer_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = (update.message.text or "").split()
-    limit = 30
-    if len(parts) > 1 and parts[1].isdigit():
-        limit = min(200, max(1, int(parts[1])))
-    rows = []
-    async with open_db() as db:
-        async with db.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)) as cur:
-            rows = await cur.fetchall()
-    lines = ["Recent audit log:"]
-    for r in rows:
-        lines.append(f"- {r['ts']} | {r['actor_user_id']} | {r['action']} | {r['payload']}")
-    msg = "\n".join(lines)
-    if len(msg) > 3900:
-        msg = msg[:3900] + "\n… (truncated)"
-    await update.message.reply_text(msg)
-
-@require_admin
-async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = now_utc()
-    default_year = now.year
-    text = (update.message.text or "").removeprefix("/notify_now").strip()
-    force = text.endswith("--force")
-    text = text.removesuffix("--force").strip()
-    ids = tokens_from_text(text)
-    async with open_db() as db:
-        if not ids:
-            rows = await due_for_reminder(db, now, default_year)
-            for r in rows:
-                await send_single_reminder(context, db, r, now, default_year)
-            await update.message.reply_text(f"Triggered reminders for {len(rows)} user(s).")
-            return
-        if len(ids) == 1 and ids[0].lower() == "all":
-            count = 0
-            async with db.execute("SELECT * FROM persons WHERE user_id IS NOT NULL") as cur:
-                async for r in cur:
-                    if not force:
-                        bday = parse_iso_date(r["birthday"])
-                        in_window, _, _ = within_100_day_window(bday, now.date())
-                        if not in_window:
-                            continue
-                        if await get_completion_year(db, r["external_id"], default_year):
-                            continue
-                    await send_single_reminder(context, db, r, now, default_year)
-                    count += 1
-            await update.message.reply_text(f"Sent reminders to {count} user(s){' (forced)' if force else ''}.")
-            return
-        ok, skipped = 0, []
-        for tok in ids:
-            r = await get_person_by_external(db, tok)
-            if not r:
-                skipped.append((tok, "no such ID"))
-                continue
-            if not force:
-                bday = parse_iso_date(r["birthday"])
-                in_window, _, _ = within_100_day_window(bday, now.date())
-                if not in_window or await get_completion_year(db, r["external_id"], default_year):
-                    skipped.append((tok, "not in window or already completed"))
-                    continue
-            await send_single_reminder(context, db, r, now, default_year)
-            ok += 1
-        msg = f"Sent to {ok} user(s){' (forced)' if force else ''}."
-        if skipped:
-            msg += "\nSkipped: " + ", ".join([f"{sid} ({why})" for sid, why in skipped])
-        await update.message.reply_text(msg)
-
-# =========================
-# App bootstrap
-# =========================
-def build_app() -> Application:
-    builder = ApplicationBuilder().token(SET.BOT_TOKEN)
-    if _AIORateLimiter is not None:
-        try:
-            builder = builder.rate_limiter(_AIORateLimiter())
-        except RuntimeError as e:
-            log.warning("RateLimiter not available: %s", e)
-
-    app = builder.build()
-
-    # User
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("verify", verify))
-    app.add_handler(CommandHandler("setname", setname))
-    app.add_handler(CommandHandler("summary", summary))
-    app.add_handler(CommandHandler("complete", complete))
-
-    # Admin
-    app.add_handler(CommandHandler("whoami", whoami))
-    app.add_handler(CommandHandler("add_personnel", add_personnel))
-    app.add_handler(CommandHandler("update_birthday", update_birthday))
-    app.add_handler(CommandHandler("import_csv", import_csv))
-    app.add_handler(CommandHandler("report", report))
-    app.add_handler(CommandHandler("export", export_all))
-    app.add_handler(CommandHandler("defer_reason", defer_reason))
-    app.add_handler(CommandHandler("defer_reset", defer_reset))
-    app.add_handler(CommandHandler("admin_complete", admin_complete))
-    app.add_handler(CommandHandler("admin_uncomplete", admin_uncomplete))
-    app.add_handler(CommandHandler("cycle_reason", cycle_reason))
-    app.add_handler(CommandHandler("cycle_reason_clear", cycle_reason_clear))
-    app.add_handler(CommandHandler("unlink_user", unlink_user_cmd))
-    app.add_handler(CommandHandler("remove_personnel", remove_personnel))
-    app.add_handler(CommandHandler("defer_audit", defer_audit))
-    app.add_handler(CommandHandler("notify_now", notify_now))
-
-    # JobQueue (optional). If missing, main() starts a fallback loop.
-    if app.job_queue is not None:
-        from datetime import timedelta as _td
-        app.job_queue.run_repeating(reminder_tick, interval=_td(hours=24), first=10)
+    today = datetime.now(SG_TZ).date()
+    st = compute_status(today, usr["birthday"], usr.get("last_completed"))
+    if st["state"] == "in_window" or st["state"] == "pre_window":
+        set_completed(update.effective_chat.id, None)
+        await update.effective_message.reply_text("✅ Cleared completion for this season.")
     else:
-        log.warning("JobQueue not available. Fallback reminder loop will be started in main().")
+        await update.effective_message.reply_text("⛔ You can only uncomplete while still within the current season window. Ask an admin if needed.")
+
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usr = get_user(update.effective_chat.id)
+    if not usr:
+        upsert_user(update.effective_chat.id, update.effective_user.username)
+        usr = get_user(update.effective_chat.id)
+    sg_today = datetime.now(SG_TZ).date()
+    await update.effective_message.reply_text(fmt_status_summary(sg_today, usr))
+
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usr = get_user(update.effective_chat.id)
+    if not usr:
+        await update.effective_message.reply_text("Not registered. Use /start.")
+        return
+    today = datetime.now(SG_TZ).date()
+    st = compute_status(today, usr.get("birthday"), usr.get("last_completed"))
+    msg = (
+        f"🪪 Your Profile\n"
+        f"• Chat ID: {usr['chat_id']}\n"
+        f"• Username: @{usr['username']}\n"
+        f"• Name: {usr.get('name') or '-'}\n"
+        f"• Birthday: {usr.get('birthday') or '-'}\n"
+        f"• Token: {usr.get('token') or '-'}\n"
+        f"\n{fmt_status_summary(today, usr)}"
+    )
+    await update.effective_message.reply_text(msg)
+
+async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_reminders_enabled(update.effective_chat.id, False)
+    await update.effective_message.reply_text("⏸️ Reminders paused. Use /resume to turn them back on.")
+
+async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_reminders_enabled(update.effective_chat.id, True)
+    await update.effective_message.reply_text("▶️ Reminders resumed.")
+
+async def test_reminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_one_reminder(update.effective_chat.id, force=True)
+    await update.effective_message.reply_text("🧪 Test reminder sent (if deliverable).")
+
+# -------------------- Admin Commands --------------------
+def parse_admin_args(args: list[str]) -> tuple[str | None, int | None, str | None]:
+    """
+    Parses: <TOKEN> [YEAR] [--date YYYY-MM-DD]
+    Returns (token, year, date_str)
+    """
+    if not args:
+        return None, None, None
+    token = args[0]
+    year = None
+    date_str = None
+    i = 1
+    if i < len(args) and args[i].isdigit():
+        year = int(args[i]); i += 1
+    if i < len(args) and args[i] == "--date":
+        if i + 1 >= len(args):
+            raise ValueError("Missing date after --date")
+        date_str = args[i + 1]
+        _ = date.fromisoformat(date_str)  # validate
+    return token, year, date_str
+
+@require_admin
+async def admin_complete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        token, year, date_str = parse_admin_args(context.args)
+        if not token:
+            await update.effective_message.reply_text("Usage: /admin_complete <TOKEN> [YEAR] [--date YYYY-MM-DD]")
+            return
+        usr = get_user_by_token(token)
+        if not usr:
+            await update.effective_message.reply_text("❌ No user found for that token.")
+            return
+        if not usr.get("birthday"):
+            await update.effective_message.reply_text("User has no birthday set.")
+            return
+        today = datetime.now(SG_TZ).date()
+        # If date not provided, use Singapore today
+        done_date = date.fromisoformat(date_str) if date_str else today
+        # Force mark as completed; this is allowed anywhere in cycle
+        set_completed(usr["chat_id"], done_date.isoformat())
+        # Update last_reminded_on to suppress same-day re-pings
+        mark_reminded_today(usr["chat_id"], today)
+        text = f"✅ Admin override: marked completed on {done_date.isoformat()}."
+        if year is not None:
+            st = compute_status(today, usr["birthday"], usr.get("last_completed"), year)
+            text += f"\nSeason ({year}): {st['start'].isoformat()} → {st['end'].isoformat()}"
+        await update.effective_message.reply_text(text)
+    except Exception as e:
+        await update.effective_message.reply_text(f"❌ Error: {e}")
+
+@require_admin
+async def admin_uncomplete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        token, year, _ = parse_admin_args(context.args)
+        if not token:
+            await update.effective_message.reply_text("Usage: /admin_uncomplete <TOKEN> [YEAR]")
+            return
+        usr = get_user_by_token(token)
+        if not usr:
+            await update.effective_message.reply_text("❌ No user found for that token.")
+            return
+        # Clear completion regardless of season (admin override)
+        set_completed(usr["chat_id"], None)
+        today = datetime.now(SG_TZ).date()
+        text = "✅ Admin override: cleared completion."
+        if year is not None and usr.get("birthday"):
+            st = compute_status(today, usr["birthday"], usr.get("last_completed"), year)
+            text += f"\nSeason ({year}): {st['start'].isoformat()} → {st['end'].isoformat()}"
+        await update.effective_message.reply_text(text)
+    except Exception as e:
+        await update.effective_message.reply_text(f"❌ Error: {e}")
+
+@require_admin
+async def admin_export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /admin_export [YEAR]
+    year = None
+    if context.args and context.args[0].isdigit():
+        year = int(context.args[0])
+    users = list_users()
+    today = datetime.now(SG_TZ).date()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["chat_id","username","name","token","birthday","season_start","season_end","last_completed","state","days_left","reminders_enabled"])
+    for u in users:
+        bday = u.get("birthday")
+        if bday:
+            start, end = compute_season(today, bday, year)
+            st = compute_status(today, bday, u.get("last_completed"), year)
+            state = st["state"]
+            days_left = st["days_left"]
+        else:
+            start = end = ""
+            state = "not_set"
+            days_left = ""
+        writer.writerow([
+            u["chat_id"], u.get("username") or "", u.get("name") or "", u.get("token") or "",
+            bday or "", start if not isinstance(start, date) else start.isoformat(),
+            end if not isinstance(end, date) else end.isoformat(),
+            u.get("last_completed") or "", state, days_left, u.get("reminders_enabled", 1),
+        ])
+    csv_bytes = io.BytesIO(buf.getvalue().encode("utf-8"))
+    csv_bytes.seek(0)
+    fname = f"ippt_export_{year or today.year}.csv"
+    await update.effective_message.reply_document(InputFile(csv_bytes, filename=fname), caption="📄 IPPT export")
+
+@require_admin
+async def admin_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Usage: /admin_add <chat_id>")
+        return
+    cid = int(context.args[0])
+    upsert_user(cid, None)
+    set_admin(cid, True)
+    await update.effective_message.reply_text(f"✅ Added admin: {cid}")
+
+@require_admin
+async def admin_remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Usage: /admin_remove <chat_id>")
+        return
+    cid = int(context.args[0])
+    set_admin(cid, False)
+    await update.effective_message.reply_text(f"✅ Removed admin: {cid}")
+
+@require_admin
+async def admin_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = list_users()
+    admin_ids = [str(u["chat_id"]) for u in users if u.get("is_admin") == 1]
+    await update.effective_message.reply_text("👑 Admins:\n" + ("\n".join(admin_ids) if admin_ids else "(none)"))
+
+# -------------------- Reminder Engine --------------------
+async def send_one_reminder(chat_id: int, force: bool = False):
+    usr = get_user(chat_id)
+    if not usr or not usr.get("reminders_enabled", 1):
+        return
+
+    sg_now = datetime.now(SG_TZ)
+    sg_today = sg_now.date()
+
+    last_day = usr.get("last_reminded_on")
+    if not force and last_day == sg_today.isoformat():
+        return
+
+    st = compute_status(sg_today, usr.get("birthday"), usr.get("last_completed"))
+    if st["state"] in ("in_window", "overdue"):
+        if st["state"] == "in_window":
+            text = (
+                f"📣 IPPT Reminder\n"
+                f"Window: {st['start'].isoformat()} → {st['end'].isoformat()}\n"
+                f"⏳ Days left: {st['days_left']}\n\n"
+                f"When completed, confirm: /complete YYYY-MM-DD"
+            )
+        else:
+            text = (
+                f"🚨 IPPT Overdue!\n"
+                f"Your window ended on {st['end'].isoformat()}.\n"
+                f"Please complete ASAP and mark it: /complete YYYY-MM-DD"
+            )
+        # ephemeral app just for sending message
+        app: Application = Application.builder().token(TOKEN).build()
+        try:
+            async with app:
+                await app.bot.send_message(chat_id=chat_id, text=text)
+            mark_reminded_today(chat_id, sg_today)
+        except Exception as e:
+            log.warning(f"Failed to send reminder to {chat_id}: {e}")
+
+async def daily_sweep(context: ContextTypes.DEFAULT_TYPE):
+    users = list_users()
+    if not users:
+        return
+    log.info(f"Daily sweep: checking {len(users)} users")
+    for u in users:
+        try:
+            await send_one_reminder(u["chat_id"])
+        except Exception as e:
+            log.exception(f"Error reminding {u['chat_id']}: {e}")
+
+def schedule_daily_job(app: Application):
+    when = datetime.now(SG_TZ).replace(hour=REMINDER_HOUR_LOCAL, minute=0, second=0, microsecond=0).timetz()
+    app.job_queue.run_daily(daily_sweep, time=when, name="daily-ippt-sweep", timezone=SG_TZ)
+    log.info("JobQueue scheduled: daily sweep at 09:00 Asia/Singapore")
+
+# -------------------- Main --------------------
+def build_app() -> Application:
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN env var is required.")
+    init_db()
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # User commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler(["register", "setbirthday"], setbirthday_cmd))
+    app.add_handler(CommandHandler("setname", setname_cmd))
+    app.add_handler(CommandHandler("complete", complete_cmd))
+    app.add_handler(CommandHandler("uncomplete", uncomplete_cmd))
+    app.add_handler(CommandHandler("summary", summary_cmd))
+    app.add_handler(CommandHandler("whoami", whoami_cmd))
+    app.add_handler(CommandHandler("pause", pause_cmd))
+    app.add_handler(CommandHandler("resume", resume_cmd))
+    app.add_handler(CommandHandler("test_reminder", test_reminder_cmd))
+
+    # Admin commands
+    app.add_handler(CommandHandler("admin_complete", admin_complete_cmd))
+    app.add_handler(CommandHandler("admin_uncomplete", admin_uncomplete_cmd))
+    app.add_handler(CommandHandler("admin_export", admin_export_cmd))
+    app.add_handler(CommandHandler("admin_add", admin_add_cmd))
+    app.add_handler(CommandHandler("admin_remove", admin_remove_cmd))
+    app.add_handler(CommandHandler("admin_list", admin_list_cmd))
+
+    # Schedule daily sweep
+    if app.job_queue is None:
+        log.warning('No JobQueue available. Install PTB with: pip install "python-telegram-bot[job-queue]~=21.6"')
+    else:
+        schedule_daily_job(app)
 
     return app
 
-async def main():
+def main():
     app = build_app()
     log.info("Starting bot…")
-
-    # Start fallback reminder loop if JobQueue is missing
-    if app.job_queue is None:
-        asyncio.create_task(reminder_loop_fallback(app, interval_hours=24))
-
-    # Manual lifecycle to avoid "event loop already running" issues
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
-    # Keep running forever
-    await asyncio.Event().wait()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    main()
