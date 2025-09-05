@@ -22,7 +22,7 @@ ADMIN_IDS = set(
 DB_PATH = os.getenv("DB_PATH", "ippt.sqlite3")
 TZ_NAME = os.getenv("TZ", "Asia/Singapore")
 SG_TZ = ZoneInfo(TZ_NAME)
-
+TZINFO = SG_TZ  # alias for legacy references
 
 
 WINDOW_DAYS = 100
@@ -1493,10 +1493,23 @@ def setup_handlers(app):
     app.add_handler(MessageHandler(filters.Document.ALL & (~filters.COMMAND), document_handler))
 
 def schedule_jobs(app):
-    if os.getenv("TEST_REMINDERS") == "1":
-        app.job_queue.run_repeating(daily_reminder_job, interval=60, first=1, name="test_reminders")
-    else:
-        app.job_queue.run_daily(daily_reminder_job, time=time(hour=9, minute=0, tzinfo=TZINFO), name="daily_reminders")
+    try:
+        # Preferred: run at 09:00 in your configured TZ
+        app.job_queue.run_daily(
+            daily_reminder_job,
+            time=time(hour=9, minute=0, tzinfo=TZINFO),
+            name="daily_reminders",
+        )
+        logging.info("JobQueue scheduled: daily reminders at 09:00 %s", TZ_NAME)
+    except TypeError:
+        # Fallback for older PTB builds: compute next 09:00 and repeat every 24h
+        now = datetime.now(SG_TZ)
+        first_run = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if first_run <= now:
+            first_run += timedelta(days=1)
+        delay = (first_run - now).total_seconds()
+        app.job_queue.run_repeating(daily_reminder_job, interval=86400, first=delay, name="daily_reminders")
+        logging.info("JobQueue scheduled via repeating: next run in %.0fs (%s)", delay, TZ_NAME)
 
 def main():
     init_db()
