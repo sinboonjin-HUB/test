@@ -531,6 +531,28 @@ async def send_single_reminder(context: ContextTypes.DEFAULT_TYPE, db: aiosqlite
             await mark_reminded(db, row["user_id"], ref_dt)
     except Exception as e:
         log.warning("Send failed to %s: %s", row["chat_id"], e)
+# --- Fallback scheduler if JobQueue isn't available ---
+import asyncio
+from datetime import datetime
+
+async def reminder_loop_fallback(app: Application, interval_hours: int = 24):
+    """Runs reminder_tick-like logic on a simple async loop."""
+    while True:
+        now = datetime.utcnow()
+        try:
+            async with open_db() as db:
+                rows = await due_for_reminder(db, now)
+                for r in rows:
+                    # reuse your helpers (or inline the message)
+                    msg = build_reminder_message(r, now)
+                    try:
+                        await app.bot.send_message(chat_id=r["chat_id"], text=msg)
+                        await mark_reminded(db, r["user_id"], now)
+                    except Exception as e:
+                        log.warning("Send failed to %s: %s", r["chat_id"], e)
+        except Exception as e:
+            log.exception("reminder_loop_fallback tick failed: %s", e)
+        await asyncio.sleep(interval_hours * 3600)
 
 
 # ----------------------------
@@ -560,13 +582,18 @@ async def reminder_tick(context: ContextTypes.DEFAULT_TYPE):
 # App bootstrap
 # ----------------------------
 def build_app() -> Application:
-    app = (
-        ApplicationBuilder()
-        .token(SET.BOT_TOKEN)
-        .rate_limiter(AIORateLimiter())  # basic flood protection
-        .build()
-    )
+    builder = ApplicationBuilder().token(SET.BOT_TOKEN)
 
+    # Optional rate limiter (only if installed)
+    try:
+        from telegram.ext import AIORateLimiter as _AIORateLimiter
+        builder = builder.rate_limiter(_AIORateLimiter())
+    except Exception:
+        pass
+
+    app = builder.build()
+
+    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("setbirthday", setbirthday))
@@ -578,21 +605,32 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("admin_complete", admin_complete))
     app.add_handler(CommandHandler("export", export_csv))
     app.add_handler(CommandHandler("import", import_csv))
+    app.add_handler(CommandHandler("notify_now", notify_now))
 
-    # Reminder job: run every REMINDER_INTERVAL_DAYS at 09:00 SGT equivalent
-    # We’ll simply run every 24h and let idempotency/interval logic gate messages.
-    app.job_queue.run_repeating(reminder_tick, interval=timedelta(hours=24), first=10)
+    # Try JobQueue; if missing, we'll start a fallback loop in main()
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(reminder_tick, interval=timedelta(hours=24), first=10)
+    else:
+        log.warning("JobQueue not available. A fallback reminder loop will be started in main().")
 
     return app
+
 
 async def main():
     app = build_app()
     log.info("Starting bot…")
     await app.initialize()
     await app.start()
+    # Start polling
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    # keep running
+
+    # Start fallback scheduler if JobQueue isn't available
+    if app.job_queue is None:
+        asyncio.create_task(reminder_loop_fallback(app, interval_hours=24))
+
+    # Keep the process alive
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     try:
