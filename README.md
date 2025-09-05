@@ -1,4 +1,4 @@
-# IPPT Reminder Bot — v2
+# IPPT Reminder Bot — Bare Date in /admin_complete + Window-only /uncomplete
 
 ## Environment (Railway)
 - BOT_TOKEN
@@ -10,7 +10,6 @@
 ## Volume
 Mount your Railway volume to `/data` so the DB persists.
 
-## Commands
-/start, /help, /setbirthday YYYY-MM-DD, /summary, /complete [--date YYYY-MM-DD],
-/uncomplete (window-only), /admin_complete <user_id> [YYYY-MM-DD], /export, /import,
-/admin_add <id>, /admin_remove <id>.
+## Notes
+- `/admin_complete` accepts `--date YYYY-MM-DD` *or* a bare `YYYY-MM-DD` anywhere.
+- `/uncomplete` only works when the user is **inside the active 100-day window**.
