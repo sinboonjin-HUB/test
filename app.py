@@ -18,7 +18,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = set(
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
-)DB_PATH = os.getenv("DB_PATH", "ippt.sqlite3")
+)
+DB_PATH = os.getenv("DB_PATH", "ippt.sqlite3")
 TZ_NAME = os.getenv("TZ", "Asia/Singapore")
 SG_TZ = ZoneInfo(TZ_NAME)
 
