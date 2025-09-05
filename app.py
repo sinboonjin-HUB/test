@@ -37,6 +37,14 @@ TOKEN_LEN = 6                # admin token length (alphanumeric)
 ENV_ADMIN_IDS = set(
     int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 )
+# --- Config (make sure this is near your other constants) ---
+TOKEN_LEN = int(os.environ.get("TOKEN_LEN", "6"))  # default 6
+
+# --- Token generator MUST be defined before init_db() ---
+import secrets, string
+def generate_token(n: int = TOKEN_LEN) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
 
 # -------------------- DB Helpers --------------------
 def init_db():
