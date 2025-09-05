@@ -507,65 +507,121 @@ async def report_cmd(update, context):
         caption="📄 CSV report"
     )
 
-
-
 # ---------- Status ----------
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+    msg = update.effective_message
     today = current_local_date()
     tid = msg.from_user.id
 
+    # Safe ISO parser for DB datetimes (handles 'Z' and offsets)
+    def _date_from_db(dt_str: str | None):
+        if not dt_str:
+            return None
+        s = dt_str.strip()
+        # Accept 'Z' as UTC
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            # As a last resort, take only date part
+            try:
+                return date.fromisoformat(s[:10])
+            except Exception:
+                return None
+        # Normalize to local date if tz-aware
+        if dt.tzinfo is not None:
+            local_dt = dt.astimezone(ZoneInfo(os.getenv("TZ", "Asia/Singapore")))
+            return local_dt.date()
+        return dt.date()
+
+    # --- Fetch user & personnel
     with closing(db_connect()) as conn:
         data = get_personnel_and_user(conn, tid)
     if not data:
         return await msg.reply_text("Please /verify first.")
 
+    # Keep your tuple unpacking order
     _, personnel_id, _, completed_year, _, birthday_str, group_name, full_name = data
-    bday = parse_date_strict(birthday_str)
 
+    # Validate birthday
+    try:
+        bday = parse_date_strict(birthday_str)
+    except Exception:
+        return await msg.reply_text("⚠️ Your birthday is not set correctly. Please /setbirthday again.")
+
+    # Window & season info
     in_window, start, end = today_in_window(bday, today)
     window_key = start.year
     next_start = adjusted_birthday_for_year(bday, start.year + 1)
 
+    # Deferment (optional)
     with closing(db_connect()) as conn:
         d = get_deferment_by_pid(conn, personnel_id, window_key)
     defer_reason, defer_status = (d[0], d[1]) if d else (None, None)
 
+    # Define cycle bounds for queries
     cycle_start = start
     cycle_end_excl = adjusted_birthday_for_year(bday, start.year + 1)
-    window_end = end
+    window_end = end  # inclusive window end by your helper semantics
 
+    # Most recent completion within window (inclusive)
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT completed_at FROM completions WHERE telegram_id=? AND completed_at >= ? AND completed_at <= ? ORDER BY completed_at DESC LIMIT 1",
+            """
+            SELECT completed_at
+            FROM completions
+            WHERE telegram_id = ?
+              AND completed_at >= ?
+              AND completed_at <= ?
+            ORDER BY completed_at DESC
+            LIMIT 1
+            """,
             (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(window_end, 23, 59)),
         )
         row_win = cur.fetchone()
-    completed_in_window_date = datetime.fromisoformat(row_win[0]).date() if row_win else None
+    completed_in_window_date = _date_from_db(row_win[0]) if row_win else None
 
+    # If none in window, check within whole cycle (exclusive upper bound)
     completed_in_cycle_date = None
     if not completed_in_window_date:
         with closing(db_connect()) as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT completed_at FROM completions WHERE telegram_id=? AND completed_at >= ? AND completed_at < ? ORDER BY completed_at DESC LIMIT 1",
-                (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(cycle_end_excl - timedelta(days=1), 23, 59)),
+                """
+                SELECT completed_at
+                FROM completions
+                WHERE telegram_id = ?
+                  AND completed_at >= ?
+                  AND completed_at <  ?
+                ORDER BY completed_at DESC
+                LIMIT 1
+                """,
+                (tid, iso_from_local_date(cycle_start, 0, 0), iso_from_local_date(cycle_end_excl, 0, 0)),
             )
             row_cyc = cur.fetchone()
-        completed_in_cycle_date = datetime.fromisoformat(row_cyc[0]).date() if row_cyc else None
+        completed_in_cycle_date = _date_from_db(row_cyc[0]) if row_cyc else None
 
+    # Window result line
     if completed_in_window_date:
         window_result_line = f"100-day window result: ✅ Completed on time ({completed_in_window_date:%Y-%m-%d})"
     elif completed_in_cycle_date:
-        overdue_days = (completed_in_cycle_date - window_end).days
+        overdue_days = max(0, (completed_in_cycle_date - window_end).days)
         window_result_line = f"100-day window result: ⚠️ Completed overdue by {overdue_days} day(s) ({completed_in_cycle_date:%Y-%m-%d})"
     else:
         window_result_line = "100-day window result: ❌ Not completed"
 
+    # IPPT status line (consider deferment & last recorded season completion)
+    # Normalise completed_year to int if present
+    try:
+        completed_year_norm = int(completed_year) if completed_year is not None else None
+    except Exception:
+        completed_year_norm = None
+
     if defer_status == "approved":
-        status_line = f"IPPT Status: Defer — {defer_reason}"
-    elif in_window and completed_year == window_key:
+        status_line = f"IPPT Status: Defer — {defer_reason or 'Approved'}"
+    elif in_window and completed_year_norm == window_key:
         status_line = "IPPT Status: ✅ Completed"
     else:
         if today < start:
@@ -576,24 +632,38 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             status_line = f"IPPT Status: Window closed — next window starts {format_date(next_start)}"
 
+    # Cycle status (for the current cycle containing 'today')
     cycle_today_start, cycle_today_end_excl = cycle_for_date(bday, today)
     cycle_window_end_today = cycle_today_start + timedelta(days=WINDOW_DAYS)
+
     with closing(db_connect()) as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT completed_at FROM completions WHERE telegram_id=? AND completed_at >= ? AND completed_at < ? ORDER BY completed_at DESC LIMIT 1",
-            (tid, iso_from_local_date(cycle_today_start, 0, 0), iso_from_local_date(cycle_today_end_excl - timedelta(days=1), 23, 59)),
+            """
+            SELECT completed_at
+            FROM completions
+            WHERE telegram_id = ?
+              AND completed_at >= ?
+              AND completed_at <  ?
+            ORDER BY completed_at DESC
+            LIMIT 1
+            """,
+            (tid, iso_from_local_date(cycle_today_start, 0, 0), iso_from_local_date(cycle_today_end_excl, 0, 0)),
         )
         r = cur.fetchone()
+
     if r:
-        cd = datetime.fromisoformat(r[0]).date()
-        if cd <= cycle_window_end_today:
+        cd = _date_from_db(r[0])
+        if cd and cd <= cycle_window_end_today:
             cycle_line = "Cycle status: ✅ Completed (on time)"
-        else:
+        elif cd:
             cycle_line = f"Cycle status: ✅ Completed (overdue by {(cd - cycle_window_end_today).days} day(s))"
+        else:
+            cycle_line = "Cycle status: Not completed"
     else:
         cycle_line = "Cycle status: Not completed"
 
+    # Compose output
     lines = [
         status_line,
         f"Window: {format_date(start)} → {format_date(end)}",
@@ -607,6 +677,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Name:   {full_name}")
     lines.append(f"ID:     {personnel_id}")
     await msg.reply_text("\n".join(lines))
+
 
 # ---------- User complete/uncomplete ----------
 async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
