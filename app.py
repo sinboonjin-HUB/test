@@ -1,6 +1,6 @@
 
 
-
+import logging
 import pytz
 import os
 import io
@@ -13,6 +13,16 @@ from zoneinfo import ZoneInfo
 
 from telegram import Update, InputFile
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | ippt-bot | %(message)s",
+)
+log = logging.getLogger("ippt-bot")
+
+
+
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -1494,22 +1504,23 @@ def setup_handlers(app):
 
 def schedule_jobs(app):
     try:
-        # Preferred: run at 09:00 in your configured TZ
         app.job_queue.run_daily(
             daily_reminder_job,
             time=time(hour=9, minute=0, tzinfo=TZINFO),
             name="daily_reminders",
         )
-        logging.info("JobQueue scheduled: daily reminders at 09:00 %s", TZ_NAME)
+        log.info("JobQueue scheduled: daily reminders at 09:00 %s", TZ_NAME)
     except TypeError:
-        # Fallback for older PTB builds: compute next 09:00 and repeat every 24h
         now = datetime.now(SG_TZ)
         first_run = now.replace(hour=9, minute=0, second=0, microsecond=0)
         if first_run <= now:
             first_run += timedelta(days=1)
         delay = (first_run - now).total_seconds()
-        app.job_queue.run_repeating(daily_reminder_job, interval=86400, first=delay, name="daily_reminders")
-        logging.info("JobQueue scheduled via repeating: next run in %.0fs (%s)", delay, TZ_NAME)
+        app.job_queue.run_repeating(
+            daily_reminder_job, interval=86400, first=delay, name="daily_reminders"
+        )
+        log.info("JobQueue scheduled via repeating: next run in %.0fs (%s)", delay, TZ_NAME)
+
 
 def main():
     init_db()
