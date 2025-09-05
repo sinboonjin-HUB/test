@@ -1,10 +1,12 @@
+# app.py
 import asyncio
 import logging
 import os
 import re
 import json
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import List, Optional, Tuple
+from contextlib import asynccontextmanager
 
 import aiosqlite
 from dateutil.parser import isoparse
@@ -68,16 +70,16 @@ SCHEMA = """
 -- Personnel roster (admin-managed)
 CREATE TABLE IF NOT EXISTS persons (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    external_id TEXT UNIQUE NOT NULL,     -- e.g., 001A
-    birthday TEXT NOT NULL,               -- YYYY-MM-DD (from roster)
-    grp TEXT,                             -- optional grouping tag
-    user_id INTEGER UNIQUE,               -- linked Telegram account
+    external_id TEXT UNIQUE NOT NULL,
+    birthday TEXT NOT NULL,
+    grp TEXT,
+    user_id INTEGER UNIQUE,
     chat_id INTEGER,
     username TEXT,
     first_name TEXT,
     last_name TEXT,
     display_name TEXT,
-    verified_at TEXT,                     -- ISO datetime
+    verified_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -90,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_persons_grp ON persons(grp);
 CREATE TABLE IF NOT EXISTS completions (
     external_id TEXT NOT NULL,
     year INTEGER NOT NULL,
-    completed_on TEXT,                    -- YYYY-MM-DD
+    completed_on TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (external_id, year),
     FOREIGN KEY (external_id) REFERENCES persons(external_id) ON DELETE CASCADE
@@ -126,25 +128,29 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 """
 
-async def ensure_schema(db: aiosqlite.Connection) -> None:
-    await db.executescript(SCHEMA)
-    await db.commit()
-
-async def open_db() -> aiosqlite.Connection:
+@asynccontextmanager
+async def open_db():
     os.makedirs(os.path.dirname(SET.DB_PATH), exist_ok=True)
     db = await aiosqlite.connect(SET.DB_PATH)
-    db.row_factory = aiosqlite.Row
-    await ensure_schema(db)
-    return db
+    try:
+        db.row_factory = aiosqlite.Row
+        await db.executescript(SCHEMA)
+        await db.commit()
+        yield db
+    finally:
+        await db.close()
 
 # =========================
 # Utilities
 # =========================
 DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
 def today_sgt() -> date:
-    # SG is UTC+8, no DST
-    return (datetime.utcnow() + timedelta(hours=8)).date()
+    # SG = UTC+8, no DST
+    return (now_utc() + timedelta(hours=8)).date()
 
 def within_100_day_window(bday: date, ref: date) -> Tuple[bool, date, date]:
     bday_this_year = bday.replace(year=ref.year)
@@ -180,7 +186,6 @@ def is_admin(uid: int) -> bool:
     return uid in SET.ADMIN_IDS
 
 def tokens_from_text(s: str) -> List[str]:
-    # split by comma or whitespace, drop empties
     raw = re.split(r"[,\s]+", s.strip())
     return [x for x in raw if x]
 
@@ -189,7 +194,7 @@ async def audit(actor_uid: int, action: str, payload: dict):
         async with open_db() as db:
             await db.execute(
                 "INSERT INTO audit_log (ts, actor_user_id, action, payload) VALUES (?,?,?,?)",
-                (datetime.utcnow().isoformat(), actor_uid, action, json.dumps(payload))
+                (now_utc().isoformat(), actor_uid, action, json.dumps(payload))
             )
             await db.commit()
     except Exception as e:
@@ -207,7 +212,7 @@ async def get_person_by_external(db: aiosqlite.Connection, external_id: str):
         return await cur.fetchone()
 
 async def create_person(db: aiosqlite.Connection, external_id: str, bday: date, grp: Optional[str]):
-    now = datetime.utcnow().isoformat()
+    now = now_utc().isoformat()
     await db.execute(
         "INSERT INTO persons (external_id, birthday, grp, created_at, updated_at) VALUES (?,?,?,?,?)",
         (external_id, bday.isoformat(), grp, now, now)
@@ -215,7 +220,7 @@ async def create_person(db: aiosqlite.Connection, external_id: str, bday: date, 
     await db.commit()
 
 async def update_birthday_row(db: aiosqlite.Connection, external_id: str, bday: date):
-    now = datetime.utcnow().isoformat()
+    now = now_utc().isoformat()
     await db.execute(
         "UPDATE persons SET birthday=?, updated_at=? WHERE external_id=?",
         (bday.isoformat(), now, external_id)
@@ -231,7 +236,7 @@ async def link_user_to_person(
     first_name: Optional[str],
     last_name: Optional[str],
 ):
-    now = datetime.utcnow().isoformat()
+    now = now_utc().isoformat()
     await db.execute(
         """
         UPDATE persons
@@ -243,7 +248,7 @@ async def link_user_to_person(
     await db.commit()
 
 async def unlink_user(db: aiosqlite.Connection, external_id: Optional[str]=None, user_id: Optional[int]=None):
-    now = datetime.utcnow().isoformat()
+    now = now_utc().isoformat()
     if external_id:
         await db.execute("UPDATE persons SET user_id=NULL, chat_id=NULL, updated_at=? WHERE external_id=?",
                          (now, external_id))
@@ -258,7 +263,7 @@ async def remove_person(db: aiosqlite.Connection, external_id: str):
 
 # completions (per year)
 async def set_completion_year(db: aiosqlite.Connection, external_id: str, year: int, when: date):
-    now = datetime.utcnow().isoformat()
+    now = now_utc().isoformat()
     await db.execute("""
         INSERT INTO completions (external_id, year, completed_on, updated_at)
         VALUES (?,?,?,?)
@@ -269,7 +274,7 @@ async def set_completion_year(db: aiosqlite.Connection, external_id: str, year: 
     await db.commit()
 
 async def clear_completion_year(db: aiosqlite.Connection, external_id: str, year: int):
-    now = datetime.utcnow().isoformat()
+    now = now_utc().isoformat()
     await db.execute("""
         INSERT INTO completions (external_id, year, completed_on, updated_at)
         VALUES (?,?,NULL,?)
@@ -287,7 +292,7 @@ async def get_completion_year(db: aiosqlite.Connection, external_id: str, year: 
 
 # defers (per year)
 async def set_defer_reason(db: aiosqlite.Connection, external_id: str, year: int, reason: str):
-    now = datetime.utcnow().isoformat()
+    now = now_utc().isoformat()
     await db.execute("""
         INSERT INTO defers (external_id, year, reason, updated_at)
         VALUES (?,?,?,?)
@@ -309,7 +314,7 @@ async def get_defer(db: aiosqlite.Connection, external_id: str, year: int) -> Op
 
 # cycle reasons (per year)
 async def set_cycle_reason(db: aiosqlite.Connection, external_id: str, year: int, reason: str):
-    now = datetime.utcnow().isoformat()
+    now = now_utc().isoformat()
     await db.execute("""
         INSERT INTO cycle_reasons (external_id, year, reason, updated_at)
         VALUES (?,?,?,?)
@@ -369,7 +374,6 @@ async def send_single_reminder(context: ContextTypes.DEFAULT_TYPE, db: aiosqlite
         log.warning("Send failed to %s: %s", person_row["chat_id"], e)
 
 async def due_for_reminder(db: aiosqlite.Connection, ref_dt: datetime, year: int):
-    """Verified users in-window, not completed, not deferred."""
     due = []
     async with db.execute("SELECT * FROM persons WHERE user_id IS NOT NULL") as cur:
         async for r in cur:
@@ -388,7 +392,7 @@ async def due_for_reminder(db: aiosqlite.Connection, ref_dt: datetime, year: int
     return due
 
 async def reminder_tick(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.utcnow()
+    now = now_utc()
     year = now.year
     async with open_db() as db:
         rows = await due_for_reminder(db, now, year)
@@ -398,12 +402,13 @@ async def reminder_tick(context: ContextTypes.DEFAULT_TYPE):
 # Fallback loop if JobQueue not available
 async def reminder_loop_fallback(app: Application, interval_hours: int = 24):
     while True:
-        now = datetime.utcnow()
+        now = now_utc()
         year = now.year
         try:
             async with open_db() as db:
                 rows = await due_for_reminder(db, now, year)
                 for r in rows:
+                    # mimic send_single_reminder without context (use app.bot)
                     completed_on = await get_completion_year(db, r["external_id"], year)
                     defer_reason = await get_defer(db, r["external_id"], year)
                     msg = build_reminder_message(r, now, completed_on, defer_reason)
@@ -444,7 +449,7 @@ def require_verified(func):
     return wrapper
 
 # =========================
-# Help text (HTML to preserve underscores)
+# Help text (HTML)
 # =========================
 HELP_TEXT = (
     "<b>IPPT Reminder Bot</b>\n\n"
@@ -512,7 +517,10 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.effective_user.username, update.effective_user.first_name, update.effective_user.last_name
         )
         await audit(update.effective_user.id, "verify", {"external_id": external_id})
-    await update.message.reply_text("Verification successful ✅\nYou can now <code>/setname</code>, <code>/summary</code>, and <code>/complete</code>.", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "Verification successful ✅\nYou can now <code>/setname</code>, <code>/summary</code>, and <code>/complete</code>.",
+        parse_mode=ParseMode.HTML
+    )
 
 @require_verified
 async def setname(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -525,7 +533,7 @@ async def setname(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Name too long. Keep within 50 characters.")
         return
     async with open_db() as db:
-        now = datetime.utcnow().isoformat()
+        now = now_utc().isoformat()
         await db.execute("UPDATE persons SET display_name=?, updated_at=? WHERE user_id=?",
                          (name, now, update.effective_user.id))
         await db.commit()
@@ -541,10 +549,8 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         year = ref.year
         completed_on = await get_completion_year(db, row["external_id"], year)
         defer_reason = await get_defer(db, row["external_id"], year)
-    status = (
-        "✅ Completed" if completed_on else
-        ("⏸️ Deferred" if defer_reason else ("🟡 In window" if in_window else "🕒 Out of window"))
-    )
+    status = ("✅ Completed" if completed_on else
+              ("⏸️ Deferred" if defer_reason else ("🟡 In window" if in_window else "🕒 Out of window")))
     who = display_name(row)
     completed = completed_on or "—"
     defer_txt = defer_reason or "—"
@@ -568,7 +574,8 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with open_db() as db:
         person = await get_person_by_user(db, update.effective_user.id)
         await set_completion_year(db, person["external_id"], year, d)
-        await audit(update.effective_user.id, "complete_self", {"external_id": person["external_id"], "year": year, "date": d.isoformat()})
+        await audit(update.effective_user.id, "complete_self",
+                    {"external_id": person["external_id"], "year": year, "date": d.isoformat()})
     await update.message.reply_text(f"Marked completed on {d.isoformat()} ✅")
 
 # =========================
@@ -582,39 +589,41 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_personnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = (update.message.text or "").split()
     if len(parts) < 3:
-        await update.message.reply_text("Usage: <code>/add_personnel &lt;ID&gt; &lt;YYYY-MM-DD&gt; [GROUP]</code>", parse_mode=ParseMode.HTML)
-        return
+        await update.message.reply_text(
+            "Usage: <code>/add_personnel &lt;ID&gt; &lt;YYYY-MM-DD&gt; [GROUP]</code>",
+            parse_mode=ParseMode.HTML
+        ); return
     external_id = parts[1]
     bday = parse_date_arg(parts[2])
     grp = parts[3] if len(parts) >= 4 else None
     if not bday:
-        await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
-        return
+        await update.message.reply_text("Invalid date. Use YYYY-MM-DD."); return
     async with open_db() as db:
         if await get_person_by_external(db, external_id):
-            await update.message.reply_text("That ID already exists.")
-            return
+            await update.message.reply_text("That ID already exists."); return
         await create_person(db, external_id, bday, grp)
-        await audit(update.effective_user.id, "add_personnel", {"external_id": external_id, "birthday": bday.isoformat(), "group": grp})
+        await audit(update.effective_user.id, "add_personnel",
+                    {"external_id": external_id, "birthday": bday.isoformat(), "group": grp})
     await update.message.reply_text(f"Added {external_id} (birthday {bday.isoformat()}{', group '+grp if grp else ''}) ✅")
 
 @require_admin
 async def update_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = (update.message.text or "").split()
     if len(parts) != 3:
-        await update.message.reply_text("Usage: <code>/update_birthday &lt;ID&gt; &lt;YYYY-MM-DD&gt;</code>", parse_mode=ParseMode.HTML)
-        return
+        await update.message.reply_text(
+            "Usage: <code>/update_birthday &lt;ID&gt; &lt;YYYY-MM-DD&gt;</code>",
+            parse_mode=ParseMode.HTML
+        ); return
     external_id = parts[1]
     bday = parse_date_arg(parts[2])
     if not bday:
-        await update.message.reply_text("Invalid date.")
-        return
+        await update.message.reply_text("Invalid date."); return
     async with open_db() as db:
         if not await get_person_by_external(db, external_id):
-            await update.message.reply_text("No such ID.")
-            return
+            await update.message.reply_text("No such ID."); return
         await update_birthday_row(db, external_id, bday)
-        await audit(update.effective_user.id, "update_birthday", {"external_id": external_id, "birthday": bday.isoformat()})
+        await audit(update.effective_user.id, "update_birthday",
+                    {"external_id": external_id, "birthday": bday.isoformat()})
     await update.message.reply_text(f"Updated {external_id} birthday → {bday.isoformat()} ✅")
 
 @require_admin
@@ -623,8 +632,10 @@ async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Reply to a CSV with headers: external_id,birthday[,group]
     """
     if not update.message or not update.message.reply_to_message or not update.message.reply_to_message.document:
-        await update.message.reply_text("Reply to a CSV file with <code>/import_csv</code>.\nHeaders: <i>external_id,birthday[,group]</i>", parse_mode=ParseMode.HTML)
-        return
+        await update.message.reply_text(
+            "Reply to a CSV file with <code>/import_csv</code>.\nHeaders: <i>external_id,birthday[,group]</i>",
+            parse_mode=ParseMode.HTML
+        ); return
     doc = update.message.reply_to_message.document
     file = await doc.get_file()
     raw = await file.download_as_bytearray()
@@ -632,7 +643,7 @@ async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = 0
     async with open_db() as db:
         reader = csv.DictReader(io.StringIO(raw.decode("utf-8")))
-        now = datetime.utcnow().isoformat()
+        now = now_utc().isoformat()
         for row in reader:
             ext = (row.get("external_id") or "").strip()
             bday_s = (row.get("birthday") or "").strip()
@@ -716,7 +727,6 @@ async def export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cycle_buf = io.StringIO()
 
     async with open_db() as db:
-        # persons
         persons_cols = ["external_id","birthday","grp","user_id","chat_id","username","first_name","last_name","display_name","verified_at","created_at","updated_at"]
         pw = csv.writer(persons_buf)
         pw.writerow(persons_cols)
@@ -724,7 +734,6 @@ async def export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async for r in cur:
                 pw.writerow([r[c] if r[c] is not None else "" for c in persons_cols])
 
-        # completions
         comp_cols = ["external_id","year","completed_on","updated_at"]
         cw = csv.writer(comp_buf)
         cw.writerow(comp_cols)
@@ -732,7 +741,6 @@ async def export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async for r in cur:
                 cw.writerow([r[c] if r[c] is not None else "" for c in comp_cols])
 
-        # defers
         defer_cols = ["external_id","year","reason","updated_at"]
         dw = csv.writer(defer_buf)
         dw.writerow(defer_cols)
@@ -740,7 +748,6 @@ async def export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async for r in cur:
                 dw.writerow([r[c] if r[c] is not None else "" for c in defer_cols])
 
-        # cycle reasons
         cycle_cols = ["external_id","year","reason","updated_at"]
         cyw = csv.writer(cycle_buf)
         cyw.writerow(cycle_cols)
@@ -748,7 +755,6 @@ async def export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async for r in cur:
                 cyw.writerow([r[c] if r[c] is not None else "" for c in cycle_cols])
 
-    # pack ZIP
     persons_buf.seek(0); comp_buf.seek(0); defer_buf.seek(0); cycle_buf.seek(0)
     zip_bytes = io.BytesIO()
     with zipfile.ZipFile(zip_bytes, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -758,7 +764,7 @@ async def export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         zf.writestr("cycle_reasons.csv", cycle_buf.getvalue())
     zip_bytes.seek(0)
 
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = now_utc().strftime("%Y%m%d_%H%M%S")
     await update.message.reply_document(
         document=zip_bytes.getvalue(),
         filename=f"ippt_export_{ts}.zip",
@@ -816,14 +822,10 @@ async def defer_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_admin
 async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /admin_complete <tokens> [YEAR] [--date YYYY-MM-DD]
-    """
     text = (update.message.text or "").removeprefix("/admin_complete").strip()
     parts = tokens_from_text(text)
     default_year = today_sgt().year
     year = get_year_arg(parts, default_year)
-    # extract date
     m = re.search(r"--date\s+(\d{4}-\d{2}-\d{2})", text)
     d = parse_iso_date(m.group(1)) if m else (parse_date_arg(text) or today_sgt())
     ids = [p for p in parts if not (p.isdigit() and len(p)==4 and int(p)==year) and p != "--date" and not DATE_RE.fullmatch(p)]
@@ -836,7 +838,8 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not await get_person_by_external(db, tok):
                 continue
             await set_completion_year(db, tok, year, d)
-            await audit(update.effective_user.id, "admin_complete", {"external_id": tok, "year": year, "date": d.isoformat()})
+            await audit(update.effective_user.id, "admin_complete",
+                        {"external_id": tok, "year": year, "date": d.isoformat()})
             done += 1
     await update.message.reply_text(f"Completed {done} id(s) for {year} on {d.isoformat()} ✅")
 
@@ -945,7 +948,6 @@ async def defer_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["Recent audit log:"]
     for r in rows:
         lines.append(f"- {r['ts']} | {r['actor_user_id']} | {r['action']} | {r['payload']}")
-    # Ensure we don't blow message size limits
     msg = "\n".join(lines)
     if len(msg) > 3900:
         msg = msg[:3900] + "\n… (truncated)"
@@ -953,7 +955,7 @@ async def defer_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_admin
 async def notify_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.utcnow()
+    now = now_utc()
     default_year = now.year
     text = (update.message.text or "").removeprefix("/notify_now").strip()
     force = text.endswith("--force")
@@ -1039,7 +1041,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("defer_audit", defer_audit))
     app.add_handler(CommandHandler("notify_now", notify_now))
 
-    # JobQueue if present; otherwise fallback loop will start in main()
+    # JobQueue (optional). If missing, main() starts a fallback loop.
     if app.job_queue is not None:
         from datetime import timedelta as _td
         app.job_queue.run_repeating(reminder_tick, interval=_td(hours=24), first=10)
@@ -1056,8 +1058,13 @@ async def main():
     if app.job_queue is None:
         asyncio.create_task(reminder_loop_fallback(app, interval_hours=24))
 
-    # Run polling (handles initialize/start/stop internally)
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Manual lifecycle to avoid "event loop already running" issues
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Keep running forever
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
