@@ -1,3 +1,4 @@
+import pytz
 import os
 import io
 import re
@@ -388,37 +389,47 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Imported {count} row(s).")
 
 # ---------- /report (CSV by default; Excel if xlsxwriter is available) ----------
-ADMIN_IDS = set(
-    int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
-)
-
 async def report_cmd(update, context):
-    chat_id = update.effective_chat.id
-    if ADMIN_IDS and chat_id not in ADMIN_IDS:
+    import os, io, csv, sqlite3
+    from datetime import datetime, date, timedelta
+    from zoneinfo import ZoneInfo
+    from telegram import InputFile
+
+    # Gate via env ADMIN_IDS (comma-separated chat IDs)
+    ADMIN_IDS = set(
+        int(x.strip())
+        for x in os.getenv("ADMIN_IDS", "").split(",")
+        if x.strip().isdigit()
+    )
+    if ADMIN_IDS and update.effective_chat.id not in ADMIN_IDS:
         await update.effective_message.reply_text("🚫 Admins only. Ask to be added to ADMIN_IDS.")
         return
 
-    # Parse args: /report [YEAR] [--xlsx]
+    # Parse args: /report [YEAR] [--xlsx|--excel]
+    args = context.args or []
     year = None
     want_xlsx = False
-    args = context.args or []
     i = 0
     if i < len(args) and args[i].isdigit():
         year = int(args[i]); i += 1
     if i < len(args) and args[i].lower() in ("--xlsx", "--excel"):
         want_xlsx = True
 
-    # Helper: compute status for a single user/season
-    def _compute(today, bday_str, last_completed_str):
-        if not bday_str:
+    tz = ZoneInfo(os.getenv("TZ", "Asia/Singapore"))
+    today = datetime.now(tz).date()
+    db_path = os.getenv("DB_PATH", "ippt.sqlite3")
+
+    # Compute season/status for a user
+    def compute_status_for(year_or_none, birthday_str, last_completed_str):
+        if not birthday_str:
             return ("not_set", None, None, None)
-        from datetime import date, timedelta
-        bday = date.fromisoformat(bday_str)
-        # Season starts on birthday (handle Feb 29 -> Feb 28 on non-leap years)
+        bday = date.fromisoformat(birthday_str)
+        yy = year_or_none if year_or_none is not None else today.year
+        # season start = birthday (handle Feb 29 on non-leap years)
         try:
-            start = date((year or today.year), bday.month, bday.day)
+            start = date(yy, bday.month, bday.day)
         except ValueError:
-            start = date((year or today.year), 2, 28)
+            start = date(yy, 2, 28)
         end = start + timedelta(days=100)
         last = date.fromisoformat(last_completed_str) if last_completed_str else None
 
@@ -430,37 +441,33 @@ async def report_cmd(update, context):
             return ("in_window", start, end, (end - today).days)
         return ("overdue", start, end, -1)
 
-    # Pull all users
-    try:
-        users = list_users()  # assumes your existing helper
-    except NameError:
-        # Fallback: query directly if helper not present
-        import sqlite3
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            users = [dict(r) for r in con.execute("SELECT * FROM users")]
+    # Pull users directly (no helper dependency)
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        users = [dict(r) for r in con.execute("SELECT * FROM users")]
 
-    sg_today = datetime.now(SG_TZ).date()
-
+    # Build rows
     rows = []
     for u in users:
         bday = u.get("birthday")
-        st, start, end, days_left = _compute(sg_today, bday, u.get("last_completed"))
-        rows.append({
-            "chat_id": u.get("chat_id"),
-            "username": u.get("username") or "",
-            "name": u.get("name") or "",
-            "birthday": bday or "",
-            "season_start": start.isoformat() if start else "",
-            "season_end": end.isoformat() if end else "",
-            "last_completed": u.get("last_completed") or "",
-            "state": st,
-            "days_left": days_left if days_left is not None else "",
-            "reminders_enabled": u.get("reminders_enabled", 1),
-            "token": u.get("token") or "",
-        })
+        state, start, end, days_left = compute_status_for(year, bday, u.get("last_completed"))
+        rows.append([
+            u.get("chat_id"),
+            u.get("username") or "",
+            u.get("name") or "",
+            bday or "",
+            start.isoformat() if start else "",
+            end.isoformat() if end else "",
+            u.get("last_completed") or "",
+            state,
+            days_left if days_left is not None else "",
+            u.get("reminders_enabled", 1),
+            u.get("token") or "",
+        ])
 
-    # ---- Excel if available & requested; else CSV ----
+    headers = ["chat_id","username","name","birthday","season_start","season_end","last_completed","state","days_left","reminders_enabled","token"]
+
+    # Excel (optional)
     if want_xlsx:
         try:
             import xlsxwriter
@@ -468,64 +475,37 @@ async def report_cmd(update, context):
             wb = xlsxwriter.Workbook(output, {"in_memory": True})
             ws = wb.add_worksheet("IPPT Report")
 
-            headers = ["chat_id","username","name","birthday","season_start","season_end","last_completed","state","days_left","reminders_enabled","token"]
-            for c,h in enumerate(headers):
-                ws.write(0, c, h)
-
+            for c, h in enumerate(headers): ws.write(0, c, h)
             for r, row in enumerate(rows, start=1):
-                ws.write(r, 0, row["chat_id"])
-                ws.write(r, 1, row["username"])
-                ws.write(r, 2, row["name"])
-                ws.write(r, 3, row["birthday"])
-                ws.write(r, 4, row["season_start"])
-                ws.write(r, 5, row["season_end"])
-                ws.write(r, 6, row["last_completed"])
-                ws.write(r, 7, row["state"])
-                ws.write(r, 8, row["days_left"] if isinstance(row["days_left"], int) else "")
-                ws.write(r, 9, row["reminders_enabled"])
-                ws.write(r,10, row["token"])
+                for c, val in enumerate(row): ws.write(r, c, val)
 
-            # Conditional formatting
             yellow = wb.add_format({"bg_color": "#FFF2CC"})
-            red = wb.add_format({"bg_color": "#F8CBAD"})
-            # Highlight days_left <= 100 (column 8, zero-indexed)
-            ws.conditional_format(1, 8, len(rows), 8, {
-                "type": "cell",
-                "criteria": "<=",
-                "value": 100,
-                "format": yellow
-            })
-            # Highlight overdue rows where state == "overdue" (column 7)
-            ws.conditional_format(1, 7, len(rows), 7, {
-                "type": "text",
-                "criteria": "containing",
-                "value": "overdue",
-                "format": red
-            })
+            red    = wb.add_format({"bg_color": "#F8CBAD"})
+            # days_left <= 100 (col 8)
+            ws.conditional_format(1, 8, len(rows), 8, {"type":"cell","criteria":"<=","value":100,"format":yellow})
+            # state contains "overdue" (col 7)
+            ws.conditional_format(1, 7, len(rows), 7, {"type":"text","criteria":"containing","value":"overdue","format":red})
 
             wb.close()
             output.seek(0)
-            fname = f"ippt_report_{year or sg_today.year}.xlsx"
-            await update.effective_message.reply_document(InputFile(output, filename=fname), caption="📊 Excel report")
+            await update.effective_message.reply_document(
+                InputFile(output, filename=f"ippt_report_{year or today.year}.xlsx"),
+                caption="📊 Excel report"
+            )
             return
         except Exception as e:
-            # Fall back to CSV if xlsxwriter missing or any Excel error
-            await update.effective_message.reply_text(f"⚠️ Excel export not available ({e}). Falling back to CSV…")
+            await update.effective_message.reply_text(f"⚠️ Excel export unavailable ({e}). Falling back to CSV…")
 
-    # CSV path (default)
+    # CSV (default)
     sio = io.StringIO()
-    writer = csv.writer(sio)
-    writer.writerow(["chat_id","username","name","birthday","season_start","season_end","last_completed","state","days_left","reminders_enabled","token"])
-    for row in rows:
-        writer.writerow([
-            row["chat_id"], row["username"], row["name"], row["birthday"],
-            row["season_start"], row["season_end"], row["last_completed"],
-            row["state"], row["days_left"], row["reminders_enabled"], row["token"]
-        ])
-    bio = io.BytesIO(sio.getvalue().encode("utf-8"))
-    bio.seek(0)
-    fname = f"ippt_report_{year or sg_today.year}.csv"
-    await update.effective_message.reply_document(InputFile(bio, filename=fname), caption="📄 CSV report")
+    w = csv.writer(sio)
+    w.writerow(headers)
+    w.writerows(rows)
+    bio = io.BytesIO(sio.getvalue().encode("utf-8")); bio.seek(0)
+    await update.effective_message.reply_document(
+        InputFile(bio, filename=f"ippt_report_{year or today.year}.csv"),
+        caption="📄 CSV report"
+    )
 
 
 
