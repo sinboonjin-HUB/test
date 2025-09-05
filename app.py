@@ -596,10 +596,26 @@ async def daily_sweep(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.exception(f"Error reminding {u['chat_id']}: {e}")
 
+from datetime import datetime, timedelta
+
 def schedule_daily_job(app: Application):
-    when = datetime.now(SG_TZ).replace(hour=REMINDER_HOUR_LOCAL, minute=0, second=0, microsecond=0).timetz()
-    app.job_queue.run_daily(daily_sweep, time=when, name="daily-ippt-sweep", timezone=SG_TZ)
-    log.info("JobQueue scheduled: daily sweep at 09:00 Asia/Singapore")
+    # Compute next 09:00 Asia/Singapore from "now"
+    now_sg = datetime.now(SG_TZ)
+    next_run = now_sg.replace(hour=REMINDER_HOUR_LOCAL, minute=0, second=0, microsecond=0)
+    if next_run <= now_sg:
+        next_run += timedelta(days=1)
+
+    delay_seconds = (next_run - now_sg).total_seconds()
+
+    # Fire once at next 09:00 SGT, then every 24h
+    app.job_queue.run_repeating(
+        daily_sweep,
+        interval=24 * 60 * 60,   # 24 hours
+        first=delay_seconds,
+        name="daily-ippt-sweep",
+    )
+    log.info("JobQueue scheduled: daily sweep at 09:00 Asia/Singapore (next run in %.0fs)", delay_seconds)
+
 
 # -------------------- Main --------------------
 def build_app() -> Application:
