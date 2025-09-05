@@ -203,6 +203,8 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /cycle_reason_clear <tokens> [YEAR]\n"
         "• /unlink_user <tokens>\n"
         "• /remove_personnel <ID[,ID,...]>\n"
+        "• /defer_audit\n"
+        "• /remind_now (manual trigger for testing)\n"
         "• /whoami"
     )
 
@@ -619,10 +621,10 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Invalid --date. Use YYYY-MM-DD.")
         tail = (tail[:m.start()] + tail[m.end():]).strip()
 
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
 
     if date_override is None:
-        date_idx = next((i for i, t in enumerate(tokens) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t)), None)
+        date_idx = next((i for i, t in enumerate(tokens) if re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", t)), None)
         if date_idx is not None:
             try:
                 date_override = parse_date_strict(tokens[date_idx])
@@ -631,7 +633,7 @@ async def admin_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tokens.pop(date_idx)
 
     year = None
-    if date_override is None and tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
+    if date_override is None and tokens and re.fullmatch(r"\\d{4}", tokens[-1] or ""):
         year = int(tokens[-1])
         tokens = tokens[:-1]
 
@@ -698,9 +700,9 @@ async def admin_uncomplete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /admin_uncomplete <tokens> [YEAR]")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
-    if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
+    if tokens and re.fullmatch(r"\\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
     if not tokens:
         return await update.message.reply_text("No IDs provided.")
@@ -739,9 +741,9 @@ async def defer_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /defer_reason <tokens> [YEAR] -- <reason>")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
-    if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
+    if tokens and re.fullmatch(r"\\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
     if not tokens:
         return await update.message.reply_text("No IDs provided.")
@@ -775,9 +777,9 @@ async def defer_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /defer_reset <tokens> [YEAR]")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
-    if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
+    if tokens and re.fullmatch(r"\\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
     if not tokens:
         return await update.message.reply_text("No IDs provided.")
@@ -811,9 +813,9 @@ async def cycle_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /cycle_reason <tokens> [YEAR] -- <reason>")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
-    if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
+    if tokens and re.fullmatch(r"\\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
     if not tokens:
         return await update.message.reply_text("No IDs provided.")
@@ -846,9 +848,9 @@ async def cycle_reason_clear(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /cycle_reason_clear <tokens> [YEAR]")
     tail = parts[1].strip()
-    tokens = [t for t in re.split(r"[,\s]+", tail) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", tail) if t]
     year = None
-    if tokens and re.fullmatch(r"\d{4}", tokens[-1] or ""):
+    if tokens and re.fullmatch(r"\\d{4}", tokens[-1] or ""):
         year = int(tokens[-1]); tokens = tokens[:-1]
     if not tokens:
         return await update.message.reply_text("No IDs provided.")
@@ -878,7 +880,7 @@ async def unlink_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split(maxsplit=1)
     if len(parts) < 2:
         return await update.message.reply_text("Usage: /unlink_user <tokens>")
-    tokens = [t for t in re.split(r"[,\s]+", parts[1]) if t]
+    tokens = [t for t in re.split(r"[,\\s]+", parts[1]) if t]
 
     cleared = 0
     with closing(db_connect()) as conn:
@@ -1062,7 +1064,7 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         groups.setdefault(key, []).append(rec)
 
     def safe_sheet_name(name: str) -> str:
-        bad = ["\", "/", "?", "*", "[", "]"]
+        bad = ["\\", "/", "?", "*", "[", "]"]
         for b in bad:
             name = name.replace(b, " ")
         name = name.strip() or "No Group"
@@ -1162,7 +1164,6 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=InputFile(out, filename="ippt_100day_report.xlsx"),
                                         caption="Report: All + per-group + Cycles_19_40 (Name included)")
 
-
 # ---------- Audit ----------
 async def defer_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.message.from_user.id):
@@ -1233,6 +1234,13 @@ async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+# Manual trigger for testing
+async def remind_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMIN_IDS:
+        return await update.message.reply_text("Admins only.")
+    await daily_reminder_job(context)
+    await update.message.reply_text("✅ Reminders triggered now.")
+
 # ---------- Wiring ----------
 def setup_handlers(app):
     # User
@@ -1259,12 +1267,16 @@ def setup_handlers(app):
     app.add_handler(CommandHandler("unlink_user", unlink_user))
     app.add_handler(CommandHandler("remove_personnel", remove_personnel))
     app.add_handler(CommandHandler("defer_audit", defer_audit))
+    app.add_handler(CommandHandler("remind_now", remind_now))
 
     # File uploads for /import_csv
     app.add_handler(MessageHandler(filters.Document.ALL & (~filters.COMMAND), document_handler))
 
 def schedule_jobs(app):
-    app.job_queue.run_daily(daily_reminder_job, time=time(hour=9, minute=0, tzinfo=TZINFO), name="daily_reminders")
+    if os.getenv("TEST_REMINDERS") == "1":
+        app.job_queue.run_repeating(daily_reminder_job, interval=60, first=1, name="test_reminders")
+    else:
+        app.job_queue.run_daily(daily_reminder_job, time=time(hour=9, minute=0, tzinfo=TZINFO), name="daily_reminders")
 
 def main():
     init_db()
