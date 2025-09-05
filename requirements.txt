@@ -1,6 +1,5 @@
-python-telegram-bot==21.6
+python-telegram-bot[rate-limiter]==21.6
 pydantic==2.9.2
 aiosqlite==0.20.0
 python-dateutil==2.9.0.post0
 tzdata==2025.1
-
