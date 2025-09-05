@@ -1435,16 +1435,30 @@ async def remind_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await daily_reminder_job(context)
     await update.message.reply_text("✅ Reminders triggered now.")
 
-# add an error handler (so you see clean messages)
-async def on_error(update, context):
+# 1) define the error handler (top-level is fine)
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.exception("Unhandled exception", exc_info=context.error)
-    if update and update.effective_message:
-        try:
+    # try to notify the user without crashing if update/message missing
+    try:
+        if isinstance(update, Update) and update.effective_message:
             await update.effective_message.reply_text("⚠️ Something went wrong while handling that command.")
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-app.add_error_handler(on_error)
+# 2) register it INSIDE build_app(), not at module scope
+def build_app() -> Application:
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # ... your other handler registrations ...
+    app.add_handler(CommandHandler("status", status))     # example
+    app.add_handler(CommandHandler("report", report_cmd)) # example
+
+    # register the error handler here
+    app.add_error_handler(on_error)
+
+    # schedule jobs etc.
+    schedule_daily_job(app)
+    return app
 
 
 # ---------- Wiring ----------
